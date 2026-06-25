@@ -1,5 +1,31 @@
 # Genesis Workbench — Changelog
 
+## Unreleased — Genomics: PRS + ancestry/population-structure PCA
+
+Two new `genomics` submodules, both Spark/Glow-native (same modality as `gwas`; no PLINK / `pgsc_calc`),
+added to the genomics submodule list so each is deployable on its own
+(`--only-submodule prs/prs_v1` / `--only-submodule pca/pca_v1`).
+
+### New `prs/prs_v1` — Polygenic Risk Scoring
+
+- Scores every sample in a VCF against a **PGS Catalog** scoring file:
+  `PRS = Σ dosage_of_effect_allele × effect_weight`. Reads the VCF with Glow
+  (`glow.genotype_states`), joins to the scoring file on `(chrom, pos)`, orients dosage to the **effect
+  allele** (`effect==alt → dosage`, `effect==ref → 2−dosage`; allele mismatches and missing genotypes
+  dropped), sums per sample, and standardizes within the cohort (z-score + percentile).
+- `prs_initial_setup_job` downloads one harmonized GRCh38 PGS Catalog scoring file (default `PGS000004`)
+  into the new `prs_reference` volume; `prs_scoring` job writes `prs_scores_<run>`. Workflow registered as a
+  batch model. Dependency-free unit test of the allele-orientation math in `tests/test_prs_scoring.py`.
+
+### New `pca/pca_v1` — Ancestry / population-structure PCA
+
+- Per-sample principal components from a cohort VCF (the covariates a GWAS should adjust for — `gwas`
+  currently runs unadjusted). Keeps biallelic common SNPs (MAF cutoff), downsamples to `max_variants`
+  (Spark ML PCA covariance is dense → columns must stay < 65535), mean-imputes missing dosage, assembles a
+  per-sample sparse vector, and fits `pyspark.ml.feature.PCA` → `pca_components_<run>` (`sample_id, PC1..PCk`).
+- `pca_compute` + `pca_initial_setup_job`; workflow registered as a batch model. NumPy-only reference test in
+  `tests/test_pca_reference.py` (PC1 separates a synthetic two-population cohort).
+
 ## v2.2.0 (2026-06-22) — KERMT 2.0 live out-of-the-box · MCP server hardened (UI + MCP grants) · fresh-install & cloud-portability fixes
 
 A consolidation release that makes the **MCP server** dependable as a first-class surface, ships **KERMT 2.0**

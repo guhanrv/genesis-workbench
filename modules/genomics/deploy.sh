@@ -32,7 +32,7 @@ echo "Extra Params: $EXTRA_PARAMS"
 echo "##############################################"
 echo "⏩️ Starting deploy of Genomics module  #"
 
-ALL_SUBMODULES=(gwas/gwas_v1 vcf_ingestion/vcf_ingestion_v1 variant_annotation/variant_annotation_v1 parabricks/parabricks_v1)
+ALL_SUBMODULES=(gwas/gwas_v1 vcf_ingestion/vcf_ingestion_v1 variant_annotation/variant_annotation_v1 parabricks/parabricks_v1 prs/prs_v1 pca/pca_v1)
 
 if [[ -n "$ONLY_SUBMODULE" ]]; then
     found=false

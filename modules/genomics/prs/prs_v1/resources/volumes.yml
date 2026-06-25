@@ -1,0 +1,19 @@
+resources:
+  volumes:
+    prs_reference_volume:
+      catalog_name: ${var.core_catalog_name}
+      schema_name: ${var.core_schema_name}
+      name: prs_reference
+      volume_type: MANAGED
+
+    prs_data_volume:
+      catalog_name: ${var.core_catalog_name}
+      schema_name: ${var.core_schema_name}
+      name: prs_data
+      volume_type: MANAGED
+
+    prs_results_volume:
+      catalog_name: ${var.core_catalog_name}
+      schema_name: ${var.core_schema_name}
+      name: prs_results
+      volume_type: MANAGED

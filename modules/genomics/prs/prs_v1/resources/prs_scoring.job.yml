@@ -1,0 +1,99 @@
+resources:
+  jobs:
+    prs_scoring:
+      name: prs_glow_scoring
+
+      email_notifications:
+        on_failure:
+          - ${var.current_user}
+
+      tasks:
+        - task_key: score_prs
+          max_retries: 0
+          job_cluster_key: prs_spark_cluster
+          libraries:
+            - jar: /Volumes/${var.core_catalog_name}/${var.core_schema_name}/libraries/glow-spark3-assembly-2.0.4-SNAPSHOT.jar
+          notebook_task:
+            notebook_path: ../notebooks/01_score_prs.py
+            source: WORKSPACE
+
+        - task_key: save_results
+          max_retries: 0
+          depends_on:
+            - task_key: score_prs
+          job_cluster_key: prs_spark_cluster
+          notebook_task:
+            notebook_path: ../notebooks/02_save_results.py
+            source: WORKSPACE
+
+        - task_key: mark_success
+          max_retries: 0
+          disable_auto_optimization: true
+          depends_on:
+            - task_key: save_results
+          run_if: ALL_SUCCESS
+          notebook_task:
+            notebook_path: ../notebooks/update_mlflow_status.py
+            source: WORKSPACE
+            base_parameters:
+              mlflow_run_id: "{{job.parameters.mlflow_run_id}}"
+              job_status: "prs_complete"
+          environment_key: default
+
+        - task_key: mark_failure
+          max_retries: 0
+          disable_auto_optimization: true
+          depends_on:
+            - task_key: save_results
+          run_if: AT_LEAST_ONE_FAILED
+          notebook_task:
+            notebook_path: ../notebooks/update_mlflow_status.py
+            source: WORKSPACE
+            base_parameters:
+              mlflow_run_id: "{{job.parameters.mlflow_run_id}}"
+              job_status: "failed"
+          environment_key: default
+
+      parameters:
+        - name: catalog
+          default: ${var.core_catalog_name}
+        - name: schema
+          default: ${var.core_schema_name}
+        - name: sql_warehouse_id
+          default: ${var.sql_warehouse_id}
+        - name: vcf_path
+          default: ""
+        - name: scorefile_path
+          default: ""
+        - name: pgs_id
+          default: ""
+        - name: mlflow_run_id
+          default: ""
+        - name: user_email
+          default: ${var.current_user}
+
+      job_clusters:
+        - job_cluster_key: prs_spark_cluster
+          new_cluster:
+            cluster_name: ""
+            spark_version: 15.4.x-scala2.12
+            spark_conf:
+              spark.sql.codegen.wholeStage: "false"
+            node_type_id: ${var.cpu_node_type}
+            driver_node_type_id: ${var.cpu_node_type}
+            custom_tags:
+              work_type: prs_scoring
+            enable_elastic_disk: true
+            data_security_mode: SINGLE_USER
+            runtime_engine: STANDARD
+            num_workers: 2
+
+      environments:
+        - environment_key: default
+          spec:
+            client: '4'
+
+      tags: ${var.common_resource_tags}
+
+      queue:
+        enabled: true

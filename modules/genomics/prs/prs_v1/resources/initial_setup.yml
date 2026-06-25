@@ -1,0 +1,66 @@
+resources:
+  jobs:
+    prs_initial_setup_job:
+      name: dbx_prs_initial_setup
+
+      email_notifications:
+        on_failure:
+          - ${var.current_user}
+
+      tasks:
+        - task_key: download_example_scorefile
+          max_retries: 0
+          job_cluster_key: prs_setup_cluster
+          notebook_task:
+            notebook_path: ../notebooks/00_download_pgs_scorefile.py
+            source: WORKSPACE
+
+        - task_key: initialize
+          disable_auto_optimization: true
+          depends_on:
+            - task_key: download_example_scorefile
+          notebook_task:
+            notebook_path: ../notebooks/initialize.py
+          max_retries: 0
+          timeout_seconds: 600
+
+      environments:
+        - environment_key: default
+          spec:
+            client: '4'
+
+      parameters:
+        - name: catalog
+          default: ${var.core_catalog_name}
+        - name: schema
+          default: ${var.core_schema_name}
+        - name: sql_warehouse_id
+          default: ${var.sql_warehouse_id}
+        - name: prs_scoring_job_id
+          default: ${resources.jobs.prs_scoring.id}
+        - name: user_email
+          default: ${var.current_user}
+        - name: databricks_app_names
+          default: genesis-workbench:mcp-genesis-workbench
+        - name: example_pgs_id
+          default: PGS000004
+
+      job_clusters:
+        - job_cluster_key: prs_setup_cluster
+          new_cluster:
+            cluster_name: ""
+            spark_version: 15.4.x-scala2.12
+            spark_conf:
+              spark.master: "local[*, 4]"
+              spark.databricks.cluster.profile: singleNode
+            node_type_id: ${var.cpu_node_type}
+            driver_node_type_id: ${var.cpu_node_type}
+            custom_tags:
+              ResourceClass: SingleNode
+              work_type: prs_setup
+            enable_elastic_disk: true
+            data_security_mode: SINGLE_USER
+            runtime_engine: STANDARD
+            num_workers: 0
+
+      tags: ${var.common_resource_tags}

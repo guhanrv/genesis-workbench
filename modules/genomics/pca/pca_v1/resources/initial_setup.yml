@@ -1,0 +1,51 @@
+resources:
+  jobs:
+    pca_initial_setup_job:
+      name: dbx_pca_initial_setup
+
+      email_notifications:
+        on_failure:
+          - ${var.current_user}
+
+      tasks:
+        - task_key: initialize
+          disable_auto_optimization: true
+          job_cluster_key: pca_setup_cluster
+          notebook_task:
+            notebook_path: ../notebooks/initialize.py
+          max_retries: 0
+          timeout_seconds: 600
+
+      parameters:
+        - name: catalog
+          default: ${var.core_catalog_name}
+        - name: schema
+          default: ${var.core_schema_name}
+        - name: sql_warehouse_id
+          default: ${var.sql_warehouse_id}
+        - name: pca_compute_job_id
+          default: ${resources.jobs.pca_compute.id}
+        - name: user_email
+          default: ${var.current_user}
+        - name: databricks_app_names
+          default: genesis-workbench:mcp-genesis-workbench
+
+      job_clusters:
+        - job_cluster_key: pca_setup_cluster
+          new_cluster:
+            cluster_name: ""
+            spark_version: 15.4.x-scala2.12
+            spark_conf:
+              spark.master: "local[*, 4]"
+              spark.databricks.cluster.profile: singleNode
+            node_type_id: ${var.cpu_node_type}
+            driver_node_type_id: ${var.cpu_node_type}
+            custom_tags:
+              ResourceClass: SingleNode
+              work_type: pca_setup
+            enable_elastic_disk: true
+            data_security_mode: SINGLE_USER
+            runtime_engine: STANDARD
+            num_workers: 0
+
+      tags: ${var.common_resource_tags}
