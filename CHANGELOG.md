@@ -6,6 +6,10 @@ Two new `genomics` submodules, both Spark/Glow-native (same modality as `gwas`; 
 added to the genomics submodule list so each is deployable on its own
 (`--only-submodule prs/prs_v1` / `--only-submodule pca/pca_v1`).
 
+**Compute split (serverless-first):** each job isolates Glow to a single `ingest_vcf` step on a classic
+cluster (Glow is a JVM Spark extension and can't run on serverless) that writes a plain dosage Delta table;
+all downstream logic (scoring / PCA) reads that table and runs on **serverless** — no Glow, no user RDD.
+
 ### New `prs/prs_v1` — Polygenic Risk Scoring
 
 - Scores every sample in a VCF against a **PGS Catalog** scoring file:
@@ -20,9 +24,11 @@ added to the genomics submodule list so each is deployable on its own
 ### New `pca/pca_v1` — Ancestry / population-structure PCA
 
 - Per-sample principal components from a cohort VCF (the covariates a GWAS should adjust for — `gwas`
-  currently runs unadjusted). Keeps biallelic common SNPs (MAF cutoff), downsamples to `max_variants`
-  (Spark ML PCA covariance is dense → columns must stay < 65535), mean-imputes missing dosage, assembles a
-  per-sample sparse vector, and fits `pyspark.ml.feature.PCA` → `pca_components_<run>` (`sample_id, PC1..PCk`).
+  currently runs unadjusted). Keeps biallelic common SNPs (MAF cutoff), mean-imputes/centers, and fits
+  `pyspark.ml.feature.PCA` with the matrix oriented **variants-as-rows × samples-as-features** so the
+  covariance is `N×N` (samples², small) regardless of variant count — distributed across variant rows, no
+  driver blow-up, no RDD. Per-sample coordinates read from `model.pc` → `pca_components_<run>`
+  (`sample_id, PC1..PCk`).
 - `pca_compute` + `pca_initial_setup_job`; workflow registered as a batch model. NumPy-only reference test in
   `tests/test_pca_reference.py` (PC1 separates a synthetic two-population cohort).
 

@@ -10,13 +10,14 @@ PRS(sample) = Σ_variants  dosage_of_effect_allele(sample) × effect_weight
 
 ## What it deploys
 
-- **`prs_scoring`** job — `01_score_prs.py` → `02_save_results.py`. Reads a VCF with
-  Glow, derives per-sample alt-allele dosage (`glow.genotype_states`), joins to the
-  scoring file on `(chrom, pos)`, orients dosage to the **effect allele**
-  (`effect==alt → dosage`, `effect==ref → 2-dosage`, mismatches/missing dropped),
-  sums `dosage × weight` per sample, and standardizes within the cohort (z-score +
-  percentile). Output: `prs_scores_<run>` Delta table
-  (`sample_id, pgs_id, prs_raw, n_variants_matched, prs_z, prs_percentile`).
+- **`prs_scoring`** job, two steps so Glow is isolated and the rest runs serverless:
+  - `00_ingest_vcf.py` — **classic cluster + Glow** (the only Glow step): reads the VCF,
+    derives per-sample alt-allele dosage (`glow.genotype_states`), writes `prs_dosage_<run>`.
+  - `01_score_prs.py` → `02_save_results.py` — **serverless** (no Glow): joins the dosage
+    table to the scoring file on `(chrom, pos)`, orients dosage to the **effect allele**
+    (`effect==alt → dosage`, `effect==ref → 2-dosage`, mismatches/missing dropped), sums
+    `dosage × weight` per sample, standardizes within the cohort. Output: `prs_scores_<run>`
+    (`sample_id, pgs_id, prs_raw, n_variants_matched, prs_z, prs_percentile`).
 - **`prs_initial_setup_job`** — downloads one harmonized GRCh38 PGS Catalog scoring
   file (default `PGS000004`) into the `prs_reference` volume and registers the
   workflow.

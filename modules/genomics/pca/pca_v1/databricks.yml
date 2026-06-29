@@ -27,7 +27,7 @@ targets:
                   availability: ON_DEMAND
         pca_compute:
           job_clusters:
-            - job_cluster_key: pca_spark_cluster
+            - job_cluster_key: pca_ingest_cluster
               new_cluster:
                 aws_attributes:
                   availability: ON_DEMAND
@@ -51,7 +51,7 @@ targets:
                   availability: ON_DEMAND_AZURE
         pca_compute:
           job_clusters:
-            - job_cluster_key: pca_spark_cluster
+            - job_cluster_key: pca_ingest_cluster
               new_cluster:
                 azure_attributes:
                   availability: ON_DEMAND_AZURE
@@ -75,7 +75,7 @@ targets:
                   availability: ON_DEMAND_GCP
         pca_compute:
           job_clusters:
-            - job_cluster_key: pca_spark_cluster
+            - job_cluster_key: pca_ingest_cluster
               new_cluster:
                 gcp_attributes:
                   availability: ON_DEMAND_GCP
