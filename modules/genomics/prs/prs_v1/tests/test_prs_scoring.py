@@ -16,10 +16,14 @@ Run: ``python -m pytest test_prs_scoring.py``  (no Spark/Glow needed).
 from __future__ import annotations
 
 
-def effect_dosage(alt_state: int, effect_allele: str, ref: str, alt: str) -> float | None:
-    """Dosage of the effect allele for one sample at one variant, or None to drop."""
-    if alt_state is None or alt_state < 0:
-        return None  # missing genotype
+def effect_dosage(alt_state, effect_allele: str, ref: str, alt: str) -> float | None:
+    """Dosage of the effect allele for one sample at one variant, or None to drop.
+
+    ``alt_state`` is the per-sample alt-allele dosage — an integer 0/1/2 for hard
+    genotype calls, OR a continuous float in [0, 2] for imputed dosage (DS/HDS).
+    Missing is normalized to ``None`` upstream in the ingest step."""
+    if alt_state is None:
+        return None  # missing genotype/dosage
     if effect_allele == alt:
         return float(alt_state)
     if effect_allele == ref:
@@ -50,8 +54,8 @@ VARIANTS = [
     {"ref": "C", "alt": "T", "effect_allele": "C", "weight": 1.0, "states": [1, 2]},
     # allele mismatch -> dropped for everyone
     {"ref": "A", "alt": "G", "effect_allele": "X", "weight": 9.9, "states": [2, 2]},
-    # missing genotype for s2 -> dropped only for s2
-    {"ref": "T", "alt": "C", "effect_allele": "C", "weight": 2.0, "states": [1, -1]},
+    # missing genotype for s2 (null from ingest) -> dropped only for s2
+    {"ref": "T", "alt": "C", "effect_allele": "C", "weight": 2.0, "states": [1, None]},
 ]
 
 
@@ -60,7 +64,13 @@ def test_effect_dosage_orientation():
     assert effect_dosage(1, "C", "C", "T") == 1.0          # ref, het -> 2-1
     assert effect_dosage(0, "C", "C", "T") == 2.0          # ref, hom-ref alt_state=0 -> 2
     assert effect_dosage(2, "X", "A", "G") is None         # mismatch
-    assert effect_dosage(-1, "C", "T", "C") is None        # missing
+    assert effect_dosage(None, "C", "T", "C") is None      # missing (null)
+
+
+def test_effect_dosage_continuous():
+    # imputed dosage (DS/HDS) is continuous, not just 0/1/2
+    assert abs(effect_dosage(0.7, "A", "G", "A") - 0.7) < 1e-9        # alt, dosage as-is
+    assert abs(effect_dosage(1.3, "C", "C", "T") - 0.7) < 1e-9        # ref, 2 - 1.3
 
 
 def test_score_samples_worked_example():

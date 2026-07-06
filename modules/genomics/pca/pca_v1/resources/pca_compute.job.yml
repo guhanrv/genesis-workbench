@@ -74,6 +74,8 @@ resources:
           default: ${var.sql_warehouse_id}
         - name: vcf_path
           default: ""
+        - name: dosage_field
+          default: "auto"
         - name: n_components
           default: "10"
         - name: maf_cutoff

@@ -12,7 +12,9 @@ PRS(sample) = Σ_variants  dosage_of_effect_allele(sample) × effect_weight
 
 - **`prs_scoring`** job, two steps so Glow is isolated and the rest runs serverless:
   - `00_ingest_vcf.py` — **classic cluster + Glow** (the only Glow step): reads the VCF,
-    derives per-sample alt-allele dosage (`glow.genotype_states`), writes `prs_dosage_<run>`.
+    derives per-sample alt-allele dosage, writes `prs_dosage_<run>`. Dosage source is chosen
+    (`dosage_field` param, default `auto`): **DS → HDS(summed) → GT** — so imputed, dosage-only
+    cohorts (no hard `GT`) work directly. Missing → `null`.
   - `01_score_prs.py` → `02_save_results.py` — **serverless** (no Glow): joins the dosage
     table to the scoring file on `(chrom, pos)`, orients dosage to the **effect allele**
     (`effect==alt → dosage`, `effect==ref → 2-dosage`, mismatches/missing dropped), sums

@@ -77,7 +77,7 @@ per_sample = (
     )
     .select(
         F.col("z.sample_ids").alias("sample_id"),
-        F.when(F.col("z.states") < 0, F.lit(None).cast("double"))
+        F.when(F.col("z.states").isNull(), F.lit(None).cast("double"))
         .when(F.col("effect_allele") == F.col("alt"), F.col("z.states").cast("double"))
         .when(F.col("effect_allele") == F.col("ref"), F.lit(2.0) - F.col("z.states").cast("double"))
         .otherwise(F.lit(None).cast("double")).alias("eff_dosage"),

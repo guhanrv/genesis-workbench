@@ -51,8 +51,8 @@ N = len(sample_ids)
 
 freq = dosage.select(
     "states", "sample_ids",
-    F.expr("aggregate(filter(states, x -> x >= 0), 0, (a, x) -> a + x)").alias("alt_sum"),
-    F.expr("size(filter(states, x -> x >= 0))").alias("n_called"),
+    F.expr("aggregate(filter(states, x -> x is not null), cast(0.0 as double), (a, x) -> a + x)").alias("alt_sum"),
+    F.expr("size(filter(states, x -> x is not null))").alias("n_called"),
 ).withColumn("af", F.col("alt_sum") / (2 * F.col("n_called")))
 
 common = freq.where((F.col("n_called") > 0) & (F.least(F.col("af"), 1 - F.col("af")) >= F.lit(maf_cutoff)))
@@ -68,9 +68,9 @@ if max_variants and max_variants > 0:
 
 @F.udf(VectorUDT())
 def center_impute(states):
-    obs = [float(x) for x in states if x is not None and x >= 0]
+    obs = [float(x) for x in states if x is not None]
     m = sum(obs) / len(obs) if obs else 0.0
-    return Vectors.dense([0.0 if (x is None or x < 0) else float(x) - m for x in states])
+    return Vectors.dense([0.0 if x is None else float(x) - m for x in states])
 
 variant_rows = common.select(center_impute(F.col("states")).alias("features"))
 

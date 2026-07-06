@@ -9,8 +9,9 @@ gap and also provide a basis for ancestry analysis.)
 
 - **`pca_compute`** job, two steps so Glow is isolated and the rest runs serverless:
   - `00_ingest_vcf.py` — **classic cluster + Glow** (the only Glow step): reads the VCF,
-    keeps biallelic SNPs, derives per-sample dosage (`glow.genotype_states`), writes
-    `pca_dosage_<run>`.
+    keeps biallelic SNPs, derives per-sample dosage, writes `pca_dosage_<run>`. Dosage source
+    is chosen (`dosage_field` param, default `auto`): **DS → HDS(summed) → GT** — so imputed,
+    dosage-only cohorts (no hard `GT`) work directly. Missing → `null`.
   - `01_compute_pca.py` → `02_save_results.py` — **serverless** (no Glow, no RDD): keeps
     common SNPs (MAF ≥ cutoff), mean-imputes/centers, and fits `pyspark.ml.feature.PCA`
     with the matrix oriented **variants-as-rows × samples-as-features** so the covariance

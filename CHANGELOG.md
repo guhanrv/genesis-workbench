@@ -10,6 +10,12 @@ added to the genomics submodule list so each is deployable on its own
 cluster (Glow is a JVM Spark extension and can't run on serverless) that writes a plain dosage Delta table;
 all downstream logic (scoring / PCA) reads that table and runs on **serverless** — no Glow, no user RDD.
 
+**Dosage input (imputed cohorts):** `ingest_vcf` derives per-sample alt-allele dosage from the best available
+field — **DS** (diploid dosage) or **HDS** (haploid pair, summed) when present, falling back to **GT** hard
+calls via `genotype_states` (overridable via the `dosage_field` param). Imputed VCFs are frequently
+dosage-only with no hard `GT`, which `genotype_states` can't read; this makes those cohorts work directly.
+Missing is normalized to `null`; dosage is continuous (0–2) and is the more accurate scoring/PCA input.
+
 ### New `prs/prs_v1` — Polygenic Risk Scoring
 
 - Scores every sample in a VCF against a **PGS Catalog** scoring file:

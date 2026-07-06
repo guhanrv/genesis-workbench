@@ -74,6 +74,8 @@ resources:
           default: ${var.sql_warehouse_id}
         - name: vcf_path
           default: ""
+        - name: dosage_field
+          default: "auto"
         - name: scorefile_path
           default: ""
         - name: pgs_id
