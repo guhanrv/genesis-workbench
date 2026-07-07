@@ -7,7 +7,7 @@
 # MAGIC observable cost); `applyInPandas` is a benchmark-gated alternative, not used here.
 # MAGIC
 # MAGIC ```
-# MAGIC raw = Σ_variant  dose · signed_weight    (+ per-PGS flip constant, folded in pgs_weights)
+# MAGIC raw = Σ_variant  dose · weight    (dose is effect-oriented per (chrom,pos,effect,other))
 # MAGIC z_msp = (raw − panel_mean[pgs,msp]) / panel_sd[pgs,msp]      (reference-panel normalized; no cohort re-rank)
 # MAGIC ```
 # MAGIC Runs on a classic cluster started minimal + titrated (see job.yml). MERGE-upserts the flat `prs_scores`.
@@ -49,7 +49,7 @@ wts = spark.table("pgs_weights").join(F.broadcast(planned_pgs), ["pgs_id", "weig
 raw = (
     dose.join(wts, "variant_id")
     .groupBy("sample_id", "pgs_id", "weight_sha")
-    .agg(F.sum(F.col("dose") * F.col("signed_weight")).alias("raw_score"),
+    .agg(F.sum(F.col("dose") * F.col("weight")).alias("raw_score"),
          F.count(F.lit(1)).alias("n_variants_matched"))
     # keep only the exact cells the plan asked for (sparse plans compute nothing extra)
     .join(plan, ["sample_id", "pgs_id", "weight_sha"])

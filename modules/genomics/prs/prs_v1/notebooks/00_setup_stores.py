@@ -40,12 +40,14 @@ CREATE TABLE IF NOT EXISTS pgs_registry (
 ) USING DELTA
 """)
 
-# 2. Weights — long, signed (function_prs's orientation trick folds allele flips into a
-#    sample-independent constant). variant_id = orientation-canonical chr:pos:allele_lo:allele_hi.
+# 2. Weights — long, EFFECT-ORIENTED: variant_id = chr:pos:effect:other and the stored
+#    dose is the dose of `effect`, so raw = Σ dose·weight (plain weight, no signed/offset).
+#    (The signed-weight/offset trick is panel-side only — it's unsafe on gVCF-extracted
+#    user dose where a REF block's FASTA base is neither catalog allele; validated on real data.)
 spark.sql("""
 CREATE TABLE IF NOT EXISTS pgs_weights (
-    pgs_id STRING, variant_id STRING, effect_allele STRING,
-    signed_weight DOUBLE, weight_sha STRING
+    pgs_id STRING, variant_id STRING, effect_allele STRING, other_allele STRING,
+    weight DOUBLE, weight_sha STRING
 ) USING DELTA
 """)
 
