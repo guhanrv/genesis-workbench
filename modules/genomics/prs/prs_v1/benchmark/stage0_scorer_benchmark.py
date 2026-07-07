@@ -195,6 +195,8 @@ def score(plan):
     (tgt.alias("t").merge(spark.table("_scored").alias("s"), "t.sample_id = s.sample_id AND t.pgs_id = s.pgs_id")
        .whenMatchedUpdateAll().whenNotMatchedInsertAll().execute())
 
+RESULTS = []   # collected per-phase metrics; returned via notebook.exit for machine-readable retrieval
+
 def run_phase(phase, mechanism="sql", sample_filter=None, pgs_filter=None):
     n_exec, cores = cluster_shape()
     t0 = now()
@@ -217,6 +219,10 @@ def run_phase(phase, mechanism="sql", sample_filter=None, pgs_filter=None):
         .select("run_ts", "phase", "mechanism", "n_exec", "cores", "n_cells", "n_dosage_rows",
                 "n_weight_rows", "wall_clock_s", "cells_per_s", "est_dbu", "est_cost_usd", "dbu_per_cell")
      ).write.mode("append").saveAsTable("stage0_metrics")
+    RESULTS.append({"phase": phase, "n_exec": n_exec, "cores": cores, "n_cells": n_cells,
+                    "n_dosage_rows": n_dose, "n_weight_rows": n_w, "wall_clock_s": round(wall, 2),
+                    "cells_per_s": round(cps, 1), "est_dbu": round(dbu, 4),
+                    "est_cost_usd": round(cost, 4), "dbu_per_cell": dpc})
     print(f"[{phase}] cells={n_cells:,} wall={wall:.1f}s cells/s={cps:,.0f} "
           f"nodes={nodes} est_cost=${cost:.4f} dbu/cell={dpc:.3e}")
     return wall, n_cells
@@ -277,3 +283,7 @@ if mode in ("score", "full"):
 
     print("\n=== stage0_metrics (this + prior runs) ===")
     spark.table("stage0_metrics").orderBy("run_ts").show(200, truncate=False)
+
+    import json as _json
+    dbutils.notebook.exit(_json.dumps({"max_loci": max_loci, "n_pgs": n_pgs, "density_pct": density_pct,
+                                       "phases": RESULTS}))
