@@ -1,109 +1,165 @@
 resources:
   jobs:
     prs_scoring:
-      name: prs_glow_scoring
+      name: prs_scoring
+
+      # Distributed, incremental, multi-PGS / multi-sample PRS.
+      #   setup_stores -> register -> extract_dosage -> reconcile -> score_prs
+      # ALL tasks run on CLASSIC job clusters with a fixed, explicit num_workers, started
+      # MINIMAL (single-node) and titrated up per job from benchmark numbers. NOTHING runs
+      # on serverless (its unbounded autoscale is the #1 bill-blowup risk). Job clusters are
+      # ephemeral (auto-terminate at job end).
+      #
+      # COST IDIOT-PROOFING: reconcile defaults to apply=false (DRY-RUN). A default run
+      # computes the plan, prints the cell count + estimated cost, writes an EMPTY runnable
+      # plan, and the scorer no-ops. To actually score you must set apply=true; a plan larger
+      # than max_cells additionally requires confirm_large=true. A stray run can never fire
+      # the full grid.
 
       email_notifications:
         on_failure:
           - ${var.current_user}
 
       tasks:
-        # Step 1 — the ONLY Glow/classic-cluster task: VCF -> dosage Delta.
-        - task_key: ingest_vcf
+        # 1 — idempotent DDL for the five persistent stores.
+        - task_key: setup_stores
           max_retries: 0
-          job_cluster_key: prs_ingest_cluster
-          libraries:
-            - jar: /Volumes/${var.core_catalog_name}/${var.core_schema_name}/libraries/glow-spark3-assembly-2.0.4-SNAPSHOT.jar
+          job_cluster_key: prs_light_cluster
           notebook_task:
-            notebook_path: ../notebooks/00_ingest_vcf.py
+            notebook_path: ../notebooks/00_setup_stores.py
             source: WORKSPACE
 
-        # Step 2+ — pure Spark on the Delta table, runs on serverless (no Glow).
+        # 2 — curation (prs.yaml + scorefiles) -> pgs_registry / pgs_weights / pgs_panel_ref.
+        - task_key: register
+          max_retries: 0
+          depends_on:
+            - task_key: setup_stores
+          job_cluster_key: prs_light_cluster
+          notebook_task:
+            notebook_path: ../notebooks/00_register_catalog.py
+            source: WORKSPACE
+
+        # 3 — per-sample gVCF -> dosage (pysam kernel; one Spark task per sample). Titrate
+        #     prs_extract_cluster.num_workers up for large cohorts (this is the real cost).
+        - task_key: extract_dosage
+          max_retries: 0
+          depends_on:
+            - task_key: register
+          job_cluster_key: prs_extract_cluster
+          notebook_task:
+            notebook_path: ../notebooks/00_extract_dosage.py
+            source: WORKSPACE
+
+        # 4 — the incremental brain + cost kill-switch: emit ONLY missing/stale cells.
+        - task_key: reconcile
+          max_retries: 0
+          depends_on:
+            - task_key: extract_dosage
+          job_cluster_key: prs_light_cluster
+          notebook_task:
+            notebook_path: ../notebooks/02_reconcile.py
+            source: WORKSPACE
+
+        # 5 — SQL join-aggregate over the plan + panel-ref normalization + MERGE prs_scores.
         - task_key: score_prs
           max_retries: 0
           depends_on:
-            - task_key: ingest_vcf
-          environment_key: default
+            - task_key: reconcile
+          job_cluster_key: prs_score_cluster
           notebook_task:
             notebook_path: ../notebooks/01_score_prs.py
             source: WORKSPACE
 
-        - task_key: save_results
-          max_retries: 0
-          depends_on:
-            - task_key: score_prs
-          environment_key: default
-          notebook_task:
-            notebook_path: ../notebooks/02_save_results.py
-            source: WORKSPACE
-
-        - task_key: mark_success
-          max_retries: 0
-          disable_auto_optimization: true
-          depends_on:
-            - task_key: save_results
-          run_if: ALL_SUCCESS
-          notebook_task:
-            notebook_path: ../notebooks/update_mlflow_status.py
-            source: WORKSPACE
-            base_parameters:
-              mlflow_run_id: "{{job.parameters.mlflow_run_id}}"
-              job_status: "prs_complete"
-          environment_key: default
-
-        - task_key: mark_failure
-          max_retries: 0
-          disable_auto_optimization: true
-          depends_on:
-            - task_key: save_results
-          run_if: AT_LEAST_ONE_FAILED
-          notebook_task:
-            notebook_path: ../notebooks/update_mlflow_status.py
-            source: WORKSPACE
-            base_parameters:
-              mlflow_run_id: "{{job.parameters.mlflow_run_id}}"
-              job_status: "failed"
-          environment_key: default
-
+      # Job-level parameters propagate to every task's matching notebook widget.
       parameters:
         - name: catalog
           default: ${var.core_catalog_name}
         - name: schema
           default: ${var.core_schema_name}
-        - name: sql_warehouse_id
-          default: ${var.sql_warehouse_id}
-        - name: vcf_path
+        # entry_mode is an OPERATOR-INTENT hint for logging (full | add_pgs | add_sample |
+        # restate_pgs). Incrementality is AUTOMATIC — reconcile's anti-join and extract's
+        # sample-skip decide the real work regardless of this value.
+        - name: entry_mode
+          default: full
+        # register
+        - name: catalog_config_path      # prs.yaml (curation source of truth)
           default: ""
-        - name: dosage_field
-          default: "auto"
-        - name: scorefile_path
+        - name: scorefile_dir            # dir of harmonized <scoring_file>s
           default: ""
-        - name: pgs_id
+        # extract
+        - name: vcf_dir
           default: ""
-        - name: mlflow_run_id
+        - name: vcf_paths
           default: ""
-        - name: user_email
-          default: ${var.current_user}
+        - name: fasta_path
+          default: ""
+        - name: reextract                # true to re-extract existing samples (after add-PGS)
+          default: "false"
+        # scope (register + extract + reconcile all honor pgs_ids)
+        - name: pgs_ids
+          default: ""
+        - name: samples                  # reconcile: limit to these sample_ids (empty = all)
+          default: ""
+        - name: panel_version
+          default: ""
+        # reconcile guardrails — DRY-RUN by default (scores nothing)
+        - name: apply
+          default: "false"
+        - name: max_cells
+          default: "100000"
+        - name: confirm_large
+          default: "false"
+        - name: dbu_per_cell             # set from Stage-0 benchmark to get a cost estimate
+          default: "0.0"
 
-      # Classic cluster used ONLY by the Glow ingest task. Everything else is serverless.
+      # Classic job clusters. START MINIMAL (single-node); titrate num_workers per job from
+      # benchmark evidence. SINGLE_USER is required for Unity Catalog access. cpu_node_type
+      # only (never GPU). No autotermination_minutes needed — job clusters die at job end.
       job_clusters:
-        - job_cluster_key: prs_ingest_cluster
+        - job_cluster_key: prs_light_cluster      # setup / register / reconcile (light SQL + parse)
           new_cluster:
-            cluster_name: ""
             spark_version: 15.4.x-scala2.12
             node_type_id: ${var.cpu_node_type}
-            driver_node_type_id: ${var.cpu_node_type}
-            custom_tags:
-              work_type: prs_ingest
-            enable_elastic_disk: true
             data_security_mode: SINGLE_USER
             runtime_engine: STANDARD
-            num_workers: 2
+            num_workers: 0
+            spark_conf:
+              spark.databricks.cluster.profile: singleNode
+              spark.master: "local[*]"
+            custom_tags:
+              ResourceClass: SingleNode
+              work_type: prs_light
+            enable_elastic_disk: true
 
-      environments:
-        - environment_key: default
-          spec:
-            client: '4'
+        - job_cluster_key: prs_extract_cluster    # per-sample gVCF extraction (CPU-bound)
+          new_cluster:
+            spark_version: 15.4.x-scala2.12
+            node_type_id: ${var.cpu_node_type}
+            data_security_mode: SINGLE_USER
+            runtime_engine: STANDARD
+            num_workers: 0                          # TITRATE UP for many samples (1 task/sample)
+            spark_conf:
+              spark.databricks.cluster.profile: singleNode
+              spark.master: "local[*]"
+            custom_tags:
+              ResourceClass: SingleNode
+              work_type: prs_extract
+            enable_elastic_disk: true
+
+        - job_cluster_key: prs_score_cluster       # join-aggregate + MERGE (shuffle-bound)
+          new_cluster:
+            spark_version: 15.4.x-scala2.12
+            node_type_id: ${var.cpu_node_type}
+            data_security_mode: SINGLE_USER
+            runtime_engine: STANDARD
+            num_workers: 0                          # TITRATE UP if shuffle/throughput needs it
+            spark_conf:
+              spark.databricks.cluster.profile: singleNode
+              spark.master: "local[*]"
+            custom_tags:
+              ResourceClass: SingleNode
+              work_type: prs_score
+            enable_elastic_disk: true
 
       tags: ${var.common_resource_tags}
 

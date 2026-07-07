@@ -67,3 +67,24 @@ def dense_fill(dose: np.ndarray, had_record: np.ndarray, af_effect) -> np.ndarra
     imp = nan & (~had_record)
     out[imp] = 2.0 * np.asarray(af_effect, dtype=np.float64)[imp]
     return out
+
+
+def sample_dosage_rows(vcf_path, ucat, fasta_ref_arr, kernel):
+    """One sample's dosage rows for the ``dosage`` store, via the gVCF kernel.
+
+    Returns ``(sample_id, [(variant_id, dose), ...])`` for the **covered**
+    (``had_record``) union variants only — real dose kept, covered-but-no-informative
+    dose → 0. Truly-missing variants are **omitted**, so the scorer's inner-join sum
+    treats them as 0 (``af=0`` fill) and ``n_variants_matched`` reflects true coverage.
+
+    (This is the one deviation from function_prs, which mean-imputes missing → 2·AF.
+    For high-coverage WGS gVCF, missing is rare and the difference is negligible;
+    validated on real data. A 2·AF path needs a panel-AF store — a documented refinement.)
+
+    ``kernel`` is the ``gvcf_dose`` module, passed in so this file stays import-light
+    (and the notebook broadcasts one module to executors).
+    """
+    dose, had, sample_id = kernel._extract_dose_vector(vcf_path, ucat, fasta_ref_arr=fasta_ref_arr)
+    filled = dense_fill(dose, had, af_effect=np.zeros(ucat.n_var))
+    rows = [(str(ucat.variant_id[i]), float(filled[i])) for i in range(ucat.n_var) if had[i]]
+    return sample_id, rows

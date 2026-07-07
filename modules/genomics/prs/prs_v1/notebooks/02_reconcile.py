@@ -107,12 +107,19 @@ print("=" * 64)
 # COMMAND ----------
 
 # --- kill-switch --------------------------------------------------------------
+# The scorer (next task) reads _prs_reconcile_plan, so we ALWAYS (over)write it here —
+# writing it EMPTY on a no-op/dry-run makes the scorer a guaranteed no-op and can never
+# re-run a stale plan left by a prior apply.
+empty_plan = plan.limit(0)
+
 if n_cells == 0:
-    print("Nothing to do — prs_scores is already reconciled (idempotent).")
+    empty_plan.write.mode("overwrite").option("overwriteSchema", "true").saveAsTable("_prs_reconcile_plan")
+    print("Nothing to do — prs_scores is already reconciled (idempotent). Wrote empty plan.")
     dbutils.notebook.exit("0")
 
 if not apply:
-    print("DRY-RUN: re-run with apply=true to write the runnable plan. Nothing scored.")
+    empty_plan.write.mode("overwrite").option("overwriteSchema", "true").saveAsTable("_prs_reconcile_plan")
+    print("DRY-RUN: wrote EMPTY plan (scorer will no-op). Re-run with apply=true to score. Nothing scored.")
     dbutils.notebook.exit(str(n_cells))
 
 if n_cells > max_cells and not confirm_large:
