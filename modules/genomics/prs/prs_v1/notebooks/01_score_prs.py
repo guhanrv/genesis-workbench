@@ -43,7 +43,17 @@ planned_pgs = plan.select("pgs_id", "weight_sha").distinct()
 
 # COMMAND ----------
 
-dose = spark.table("dosage").join(F.broadcast(planned_samples), "sample_id")            # only planned samples
+# Incremental fast path: when the plan targets few samples (add-sample / small batch), prune
+# `dosage` with an explicit sample_id predicate so Liquid Clustering (CLUSTER BY sample_id) SKIPS
+# files instead of scanning the whole store. Stage-0 measured that a broadcast join here re-scans
+# all dosage rows even to score one new sample; the predicate turns that full scan into a file-skip.
+# Full backfills (many planned samples) skip the predicate and read all files (correct + fastest).
+SAMPLE_PREDICATE_MAX = 200
+_planned_ids = [r["sample_id"] for r in planned_samples.limit(SAMPLE_PREDICATE_MAX + 1).collect()]
+if 0 < len(_planned_ids) <= SAMPLE_PREDICATE_MAX:
+    dose = spark.table("dosage").where(F.col("sample_id").isin(_planned_ids))            # file-skip to planned samples
+else:
+    dose = spark.table("dosage").join(F.broadcast(planned_samples), "sample_id")         # backfill: read all
 wts = spark.table("pgs_weights").join(F.broadcast(planned_pgs), ["pgs_id", "weight_sha"])  # only planned pgs@sha
 
 raw = (

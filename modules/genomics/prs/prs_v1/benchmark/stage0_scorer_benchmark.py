@@ -63,7 +63,7 @@ def now(): return time.time()
 spark.sql("CREATE TABLE IF NOT EXISTS pgs_registry (pgs_id STRING, score_id STRING, disease STRING, direction STRING, body_system STRING, hr_per_sd DOUBLE, clinical_model STRING, training_ancestries STRING, weight_sha STRING, n_variants BIGINT, weight_path STRING, registered_at TIMESTAMP) USING DELTA")
 spark.sql("CREATE TABLE IF NOT EXISTS pgs_weights (pgs_id STRING, variant_id STRING, effect_allele STRING, other_allele STRING, weight DOUBLE, weight_sha STRING) USING DELTA")
 spark.sql("CREATE TABLE IF NOT EXISTS pgs_panel_ref (pgs_id STRING, superpop STRING, mean DOUBLE, sd DOUBLE, quantiles ARRAY<DOUBLE>, n_panel INT, panel_version STRING, weight_sha STRING) USING DELTA")
-spark.sql("CREATE TABLE IF NOT EXISTS dosage (sample_id STRING, variant_id STRING, dose DOUBLE) USING DELTA")
+spark.sql("CREATE TABLE IF NOT EXISTS dosage (sample_id STRING, variant_id STRING, dose DOUBLE) USING DELTA CLUSTER BY (sample_id)")
 spark.sql("CREATE TABLE IF NOT EXISTS sample_ancestry (sample_id STRING, most_similar_pop STRING) USING DELTA")
 spark.sql("CREATE TABLE IF NOT EXISTS prs_scores (sample_id STRING, pgs_id STRING, weight_sha STRING, panel_version STRING, raw_score DOUBLE, n_variants_matched INT, coverage_pct DOUBLE, small_score BOOLEAN, most_similar_pop STRING, used_ancestry STRING, z_msp DOUBLE, percentile_msp DOUBLE, z_admixed DOUBLE, percentile_admixed DOUBLE, integrated_z_source STRING, integrated_risk_10yr DOUBLE, clinical_risk_10yr DOUBLE, risk_category STRING, concordance_verdict STRING, computed_at TIMESTAMP) USING DELTA PARTITIONED BY (pgs_id)")
 spark.sql("CREATE TABLE IF NOT EXISTS stage0_metrics (run_ts TIMESTAMP, phase STRING, mechanism STRING, n_exec INT, cores INT, n_cells BIGINT, n_dosage_rows BIGINT, n_weight_rows BIGINT, wall_clock_s DOUBLE, cells_per_s DOUBLE, est_dbu DOUBLE, est_cost_usd DOUBLE, dbu_per_cell DOUBLE) USING DELTA")
@@ -93,7 +93,11 @@ if mode in ("prep", "full"):
                         F.lit("A"), F.lit("G")).alias("variant_id"),
             F.col("z.states").cast("double").alias("dose"))
         .where(F.col("dose").isNotNull()))
-    long.write.mode("overwrite").option("overwriteSchema", "true").saveAsTable("dosage")
+    # (re)create clustered so the A/B re-measure exercises Liquid Clustering file-skipping
+    spark.sql("DROP TABLE IF EXISTS dosage")
+    spark.sql("CREATE TABLE dosage (sample_id STRING, variant_id STRING, dose DOUBLE) USING DELTA CLUSTER BY (sample_id)")
+    long.write.mode("append").saveAsTable("dosage")
+    spark.sql("OPTIMIZE dosage")   # cluster the written data by sample_id
     n_dose = spark.table("dosage").count()
     n_samp = spark.table("dosage").select("sample_id").distinct().count()
     vids = spark.table("dosage").select("variant_id").distinct()
@@ -165,7 +169,13 @@ def reconcile(sample_filter=None, pgs_filter=None):
 def score(plan):
     planned_samples = plan.select("sample_id").distinct()
     planned_pgs = plan.select("pgs_id", "weight_sha").distinct()
-    dose = spark.table("dosage").join(F.broadcast(planned_samples), "sample_id")
+    # incremental fast path (mirrors 01_score_prs): small plan → predicate → Liquid-Clustering file-skip
+    SAMPLE_PREDICATE_MAX = 200
+    _ids = [r["sample_id"] for r in planned_samples.limit(SAMPLE_PREDICATE_MAX + 1).collect()]
+    if 0 < len(_ids) <= SAMPLE_PREDICATE_MAX:
+        dose = spark.table("dosage").where(F.col("sample_id").isin(_ids))
+    else:
+        dose = spark.table("dosage").join(F.broadcast(planned_samples), "sample_id")
     wts = spark.table("pgs_weights").join(F.broadcast(planned_pgs), ["pgs_id", "weight_sha"])
     raw = (dose.join(wts, "variant_id").groupBy("sample_id", "pgs_id", "weight_sha")
            .agg(F.sum(F.col("dose") * F.col("weight")).alias("raw_score"),

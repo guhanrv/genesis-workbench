@@ -60,12 +60,15 @@ CREATE TABLE IF NOT EXISTS pgs_panel_ref (
 ) USING DELTA
 """)
 
-# 4. Dosage — per-sample alt-allele dosage at union variants. Sparse (carried/non-ref only; ref
-#    imputed at read). Incrementally extended via anti-join on missing (sample_id, variant_id).
+# 4. Dosage — per-sample effect-allele dosage at covered union variants (real dose / covered-REF→0;
+#    truly-missing omitted → scorer treats as 0). Incrementally extended via anti-join on missing
+#    (sample_id, variant_id). CLUSTER BY sample_id (Liquid Clustering): add-sample / small-batch
+#    scoring file-skips to just those samples instead of scanning the whole store (Stage-0 finding).
 spark.sql("""
 CREATE TABLE IF NOT EXISTS dosage (
     sample_id STRING, variant_id STRING, dose DOUBLE
 ) USING DELTA
+CLUSTER BY (sample_id)
 """)
 
 # 5. Scores cell-store — the results. Flat scalars → MERGE-safe. Partitioned by pgs_id
