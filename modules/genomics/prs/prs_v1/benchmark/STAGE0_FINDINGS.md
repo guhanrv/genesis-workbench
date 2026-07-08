@@ -72,6 +72,43 @@ so more nodes just add distribution/coordination overhead with no parallelism to
 6. **Extraction, not scoring, is the real production cost** (large WGS gVCFs, minutes/sample). Benchmark it
    separately on real gVCFs (PHI/data-governance decision); the scorer backfill is single-digit dollars.
 
+## Genome-wide ramp — sample scaling at 1M loci (`stage0_genomewide_ramp.py`)
+
+Probes the regime the cohort test couldn't: 1,000,000 synthetic loci (≈ one small genome-wide PGS),
+1 PGS, **sample count ramped 1→128 in one guarded single-node run** (12.3 min, ≈$0.06, no guard hit).
+
+| N samples | dosage rows | full-backfill wall | task_s | input_MB | shuffle_MB | spill_MB |
+|---|---|---|---|---|---|---|
+| 1 | 1M | 15.2s | 14.3 | 11.8 | 14.7 | 0 |
+| 8 | 8M | 14.2s | 15.7 | 0.3 | 25.5 | 0 |
+| 16 | 16M | 15.8s | 18.9 | 0.3 | 25.5 | 0 |
+| 32 | 32M | 18.4s | 25.4 | 0.5 | 25.5 | 0 |
+| 64 | 64M | 24.5s | 40.4 | 1.3 | 25.5 | 0 |
+| 128 | 128M | 26.9s | 69.2 | 2.5 | 25.5 | 0 |
+| **add_sample** (1 new → 128M store) | 129M | **14.9s** | 24.1 | 5.5 | 14.8 | 0 |
+| **add_batch_x50** (50 new) | 179M | 24.1s | 42.8 | 1.8 | 25.5 | 0 |
+
+Findings:
+- **Scan stays cheap even at 128M rows** (`input_MB` ≤ 12). Dosage is inherently dictionary-compressible
+  (variant_ids repeat across samples, dose ∈ {0,1,2}) → MBs on disk. **A "GB-scan" regime does NOT arise at
+  1M loci × 128 samples** — it needs the full ~19M-variant union and/or thousands of samples.
+- **No spill at any rung** — a single 64 GB node handles 128M rows fine.
+- **The regime shift is CPU/`task_s`, not scan/shuffle/spill.** `task_s` grows with samples (15→69 from
+  N=8→128); wall is floor-bound (~14s) up to ~N=16, then grows with work. N=128 full backfill = **27s**.
+- **Shuffle is ~flat at ~25 MB (weights-bound)** — the 1M-row weight side dominates the shuffle; the dosage
+  side stays modest.
+- **Option A's file-skip PAYS OFF here** (it didn't at 30k loci): `add_sample` onto a 128M-row store is
+  **14.9s** with `task_s`≈24 — i.e. it scores just the new sample (≈ scoring 1 sample fresh), NOT a
+  128M-row re-scan (which would be `task_s`≈69, ~27s). Liquid Clustering + the predicate prune to the new
+  sample's files once the store spans many files.
+- **Batching still ~31× at scale**: 50 new samples = 24.1s vs 1 new = 14.9s → ~0.48s/sample batched.
+
+Net: the **scorer is remarkably cheap on modest hardware** — genome-wide single-PGS × 128 samples backfills
+in ~27s single-node and onboards a member in ~15s, no spill. The "big leagues" cost is **extraction**
+(per-sample gVCF, minutes each), not scoring. The single-node ceiling (where spill / workers finally
+matter) is beyond 128M compressible rows — reachable only with the full multi-PGS union (tens of millions
+of loci) and/or thousands of samples; that rung is a further gated step.
+
 ## Caveat — small-scale regime
 Every number here is the **cohort/chr-scale (MB) regime**, where the scorer is orchestration-bound and
 workers don't help. At **genome-wide scale (GB dosage, 48M-weight PGS that won't broadcast)** the profile
