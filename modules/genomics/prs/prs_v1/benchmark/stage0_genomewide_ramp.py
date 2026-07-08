@@ -85,7 +85,7 @@ for t in ["dosage", "pgs_weights", "pgs_registry", "pgs_panel_ref", "sample_ance
     spark.sql(f"DROP TABLE IF EXISTS {t}")
 spark.sql("CREATE TABLE dosage (sample_id STRING, variant_id STRING, dose DOUBLE) USING DELTA CLUSTER BY (sample_id)")
 spark.sql("CREATE TABLE prs_scores (sample_id STRING, pgs_id STRING, weight_sha STRING, panel_version STRING, raw_score DOUBLE, n_variants_matched INT, coverage_pct DOUBLE, small_score BOOLEAN, most_similar_pop STRING, used_ancestry STRING, z_msp DOUBLE, percentile_msp DOUBLE, z_admixed DOUBLE, percentile_admixed DOUBLE, integrated_z_source STRING, integrated_risk_10yr DOUBLE, clinical_risk_10yr DOUBLE, risk_category STRING, concordance_verdict STRING, computed_at TIMESTAMP) USING DELTA PARTITIONED BY (pgs_id)")
-spark.sql("CREATE TABLE stage0_gw_metrics (run_ts TIMESTAMP, phase STRING, n_samples LONG, n_dosage_rows LONG, n_weight_rows LONG, n_cells LONG, wall_clock_s DOUBLE, task_s DOUBLE, input_mb DOUBLE, shuffle_mb DOUBLE, spill_mb DOUBLE, est_cost_usd DOUBLE) USING DELTA")
+spark.sql("CREATE TABLE IF NOT EXISTS stage0_gw_metrics (run_ts TIMESTAMP, phase STRING, n_samples LONG, n_dosage_rows LONG, n_weight_rows LONG, n_cells LONG, wall_clock_s DOUBLE, task_s DOUBLE, input_mb DOUBLE, shuffle_mb DOUBLE, spill_mb DOUBLE, est_cost_usd DOUBLE) USING DELTA")  # persists + accumulates across ramp steps
 
 # synthetic loci (variant_id) + weights + registry + panel — one PGS per n_pgs, deterministic weights
 loci = spark.range(synth_loci).select(F.concat_ws(":", F.lit("1"), (F.col("id") + 1).cast("string"), F.lit("A"), F.lit("G")).alias("variant_id"))
