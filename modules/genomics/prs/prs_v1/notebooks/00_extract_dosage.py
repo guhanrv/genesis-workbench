@@ -95,13 +95,28 @@ print(f"union catalog: {ucat.n_var} variants" + (f" (restricted to {pgs_filter})
 # precompute FASTA ref base per catalog position ONCE on the driver (amortized across all samples).
 # Content-addressed cache: the array is identical for a given (registered PGS set + FASTA), so a
 # repeat run reads the cached .npz instead of rebuilding (~30s → ~0). Profile showed this was 21%.
+# Volumes are FUSE-mounted and DON'T support the random seek() that np.savez/np.load (zip) need,
+# so cache on LOCAL disk and sync to the Volume with dbutils.fs.cp (sequential, FUSE-safe). Repeat
+# runs pull the ~MB .npz and skip the ~30s rebuild (Stage-0: 21% of the pipeline).
 cache_path = None
+_vol_cache = None
 if fasta_ref_cache_dir:
     sel = [f"{r['pgs_id']}:{r['weight_sha']}" for r in
            wq.select("pgs_id", "weight_sha").distinct().orderBy("pgs_id", "weight_sha").collect()]
     key = hashlib.sha256(("|".join(sel) + "|" + os.path.basename(fasta_path)).encode()).hexdigest()[:16]
-    cache_path = Path(fasta_ref_cache_dir) / f"fastaref_{ucat.n_var}_{key}.npz"
+    fname = f"fastaref_{ucat.n_var}_{key}.npz"
+    cache_path = Path("/tmp") / fname                       # local disk → seek OK for np.savez/load
+    _vol_cache = fasta_ref_cache_dir.rstrip("/") + "/" + fname
+    try:
+        dbutils.fs.cp(_vol_cache, "file:" + str(cache_path)); print("fasta-ref cache: pulled from volume")
+    except Exception:
+        pass                                                # cold: build below, push after
 fasta_ref = kern.build_catalog_fasta_ref(ucat, fasta_path, cache_path=cache_path)
+if _vol_cache and cache_path is not None and cache_path.exists():
+    try:
+        dbutils.fs.mkdirs(fasta_ref_cache_dir); dbutils.fs.cp("file:" + str(cache_path), _vol_cache)
+    except Exception as e:
+        print("warn: fasta-ref cache push to volume failed (non-fatal):", e)
 if shard_by_chrom:
     # split by chrom → each (sample × chrom) task reads only that chrom's gVCF region (tabix),
     # so a sample's genome-wide walk parallelizes across chroms/cores (big onboarding speedup).
