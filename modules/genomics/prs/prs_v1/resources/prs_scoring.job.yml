@@ -94,6 +94,8 @@ resources:
           default: ""
         - name: fasta_path
           default: ""
+        - name: fasta_ref_cache_dir     # cache the FASTA-ref array → repeat extractions skip the ~30s rebuild
+          default: ${var.prs_fasta_ref_cache}
         - name: reextract                # true to re-extract existing samples (after add-PGS)
           default: "false"
         # scope (register + extract + reconcile all honor pgs_ids)

@@ -24,6 +24,7 @@ dbutils.widgets.text("schema", "genesis_schema", "Schema")
 dbutils.widgets.text("vcf_dir", "", "Dir of gVCFs (each *.vcf.gz / *.g.vcf.gz = one sample)")
 dbutils.widgets.text("vcf_paths", "", "Explicit gVCF paths (comma-sep; overrides vcf_dir)")
 dbutils.widgets.text("fasta_path", "", "GRCh38 FASTA (.fna.bgz) for REF-block resolution")
+dbutils.widgets.text("fasta_ref_cache_dir", "", "Volume dir to cache the FASTA-ref array (skips the ~30s rebuild on repeat runs)")
 dbutils.widgets.text("pgs_ids", "", "Restrict union to these PGS' variants (comma-sep; empty = all registered)")
 dbutils.widgets.text("reextract", "false", "true = re-extract samples already in dosage (needed after add-PGS)")
 dbutils.widgets.text("shard_by_chrom", "true", "Shard extraction (sample × chrom) — parallelizes each sample's walk across chroms")
@@ -40,6 +41,8 @@ schema = dbutils.widgets.get("schema")
 
 import os
 import glob
+import hashlib
+from pathlib import Path
 import numpy as np
 import pandas as pd
 import pysam
@@ -52,6 +55,7 @@ schema = dbutils.widgets.get("schema")
 vcf_dir = dbutils.widgets.get("vcf_dir")
 vcf_paths_arg = dbutils.widgets.get("vcf_paths")
 fasta_path = dbutils.widgets.get("fasta_path")
+fasta_ref_cache_dir = dbutils.widgets.get("fasta_ref_cache_dir").strip()
 pgs_filter = [x.strip() for x in dbutils.widgets.get("pgs_ids").split(",") if x.strip()]
 reextract = dbutils.widgets.get("reextract").strip().lower() == "true"
 shard_by_chrom = dbutils.widgets.get("shard_by_chrom").strip().lower() == "true"
@@ -88,8 +92,16 @@ rows = [(r["chrom"], r["pos"], r["effect"], r["other"]) for r in uv.collect()]
 ucat = ext.build_union_catalog(rows)
 print(f"union catalog: {ucat.n_var} variants" + (f" (restricted to {pgs_filter})" if pgs_filter else ""))
 
-# precompute FASTA ref base per catalog position ONCE on the driver (amortized across all samples)
-fasta_ref = kern.build_catalog_fasta_ref(ucat, fasta_path)
+# precompute FASTA ref base per catalog position ONCE on the driver (amortized across all samples).
+# Content-addressed cache: the array is identical for a given (registered PGS set + FASTA), so a
+# repeat run reads the cached .npz instead of rebuilding (~30s → ~0). Profile showed this was 21%.
+cache_path = None
+if fasta_ref_cache_dir:
+    sel = [f"{r['pgs_id']}:{r['weight_sha']}" for r in
+           wq.select("pgs_id", "weight_sha").distinct().orderBy("pgs_id", "weight_sha").collect()]
+    key = hashlib.sha256(("|".join(sel) + "|" + os.path.basename(fasta_path)).encode()).hexdigest()[:16]
+    cache_path = Path(fasta_ref_cache_dir) / f"fastaref_{ucat.n_var}_{key}.npz"
+fasta_ref = kern.build_catalog_fasta_ref(ucat, fasta_path, cache_path=cache_path)
 if shard_by_chrom:
     # split by chrom → each (sample × chrom) task reads only that chrom's gVCF region (tabix),
     # so a sample's genome-wide walk parallelizes across chroms/cores (big onboarding speedup).

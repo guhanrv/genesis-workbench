@@ -44,6 +44,12 @@ variables:
   sql_warehouse_id:
     description: Id of the SQL Warehouse that will be used by the app
 
+  prs_fasta_ref_cache:
+    description: >-
+      Volume dir caching the content-addressed FASTA-ref array (keyed by registered-PGS set + FASTA),
+      so repeat/incremental extractions skip the ~30s rebuild (Stage-0 profile: 21% of the pipeline).
+    default: /Volumes/${var.core_catalog_name}/${var.core_schema_name}/prs_reference/fasta_ref_cache
+
   prs_landing_zone:
     description: >-
       Volume dir where incoming gVCFs land. The prs_scoring job's file-arrival trigger monitors it
