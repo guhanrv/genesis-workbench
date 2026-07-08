@@ -75,13 +75,29 @@ def parse_scorefile(scorefile_path):
     return rows
 
 
-def weights_rows(pgs_id: str, scorefile_rows, weight_sha: str):
+_PALINDROMIC = ({"A", "T"}, {"C", "G"})
+
+
+def is_palindromic(effect: str, other: str) -> bool:
+    """Strand-ambiguous SNP (A/T or C/G): the effect allele can't be strand-resolved
+    without extra info, so the extracted dose may be for the wrong strand."""
+    return {str(effect).upper(), str(other).upper()} in _PALINDROMIC
+
+
+def weights_rows(pgs_id: str, scorefile_rows, weight_sha: str, drop_palindromic: bool = True):
     """Effect-oriented pgs_weights rows, deduped by variant_id (weights summed).
 
     Returns list of dicts: pgs_id, variant_id, effect_allele, other_allele, weight, weight_sha.
+
+    ``drop_palindromic`` (default True): skip A/T and C/G SNPs — they're strand-ambiguous, so a
+    gVCF-extracted dose can silently be for the wrong strand. This matches pgsc_calc/plink2 (and
+    function_prs) drop-mode. Parity-validated: dropping them makes this pipeline's raw score match
+    function_prs to machine epsilon on PGS000004 (the 31 palindromic vars there flip the sign).
     """
     acc: dict[str, dict] = {}
     for chrom, pos, effect, other, w in scorefile_rows:
+        if drop_palindromic and is_palindromic(effect, other):
+            continue
         vid = f"{chrom}:{pos}:{effect}:{other}"
         r = acc.get(vid)
         if r is None:
