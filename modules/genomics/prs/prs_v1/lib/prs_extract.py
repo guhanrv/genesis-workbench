@@ -69,6 +69,29 @@ def dense_fill(dose: np.ndarray, had_record: np.ndarray, af_effect) -> np.ndarra
     return out
 
 
+def orient_alt_dose(effect, other, ref, alt, alt_dose, drop_palindromic: bool = True):
+    """Effect-allele dose from a hard-called/imputed variant's ALT dosage (the Glow path).
+
+    Glow/plink give ``alt_dose`` = copies of ALT. We want copies of ``effect``:
+
+      effect == alt  and  other == ref   → alt_dose            (effect is ALT)
+      effect == ref  and  other == alt   → 2 − alt_dose        (effect is REF; diploid flip)
+      otherwise                           → None               (allele set doesn't match — skip)
+
+    Palindromic (A/T, C/G) SNPs are dropped when ``drop_palindromic`` (strand-ambiguous — same rule
+    the gVCF/registration path uses). This is the hard-called analogue of the gVCF kernel's
+    effect-oriented dose, so both paths write the same ``dosage`` semantics.
+    """
+    e, o, r, a = str(effect).upper(), str(other).upper(), str(ref).upper(), str(alt).upper()
+    if drop_palindromic and {e, o} in ({"A", "T"}, {"C", "G"}):
+        return None
+    if e == a and o == r:
+        return alt_dose
+    if e == r and o == a:
+        return 2.0 - alt_dose
+    return None
+
+
 def split_catalog_by_chrom(ucat, fasta_ref):
     """Split a UnionCatalog (+ its fasta_ref array) into per-chrom plain-array bundles, for
     ``(sample × chrom)`` sharded extraction: each shard reads only one chromosome's gVCF region
