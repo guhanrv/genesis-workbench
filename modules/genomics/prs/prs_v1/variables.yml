@@ -43,3 +43,10 @@ variables:
 
   sql_warehouse_id:
     description: Id of the SQL Warehouse that will be used by the app
+
+  prs_landing_zone:
+    description: >-
+      Volume dir where incoming gVCFs land. The prs_scoring job's file-arrival trigger monitors it
+      and BATCHES arrivals (one run drains all pending gVCFs — ~45x cheaper/member than per-member
+      runs, per Stage-0). Also the default vcf_dir for extraction.
+    default: /Volumes/${var.core_catalog_name}/${var.core_schema_name}/prs_data/incoming

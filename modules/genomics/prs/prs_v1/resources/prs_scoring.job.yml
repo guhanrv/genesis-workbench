@@ -86,9 +86,10 @@ resources:
           default: ""
         - name: scorefile_dir            # dir of harmonized <scoring_file>s
           default: ""
-        # extract
+        # extract — defaults to the batched landing zone (a triggered run drains ALL pending gVCFs
+        # in one pass; extract's sample-level anti-join skips ones already in dosage).
         - name: vcf_dir
-          default: ""
+          default: ${var.prs_landing_zone}
         - name: vcf_paths
           default: ""
         - name: fasta_path
@@ -165,3 +166,20 @@ resources:
 
       queue:
         enabled: true
+
+      # ── BATCH onboarding (Stage-0 finding: ~45× cheaper/member than per-member runs) ─────────────
+      # The reconcile + scorer are ALREADY batch (one pass scores every missing cell across all pending
+      # samples); the lever is the TRIGGER. This file-arrival trigger BATCHES: it fires at most once per
+      # `min_time_between_triggers_seconds` and waits for arrivals to settle, so all gVCFs that land in
+      # the window are drained in ONE run — the ~fixed per-run floor (reconcile + Spark job launches +
+      # MERGE, ~9s) is paid once for the whole batch instead of per member.
+      #
+      # PAUSED by default: enable (pause_status: UNPAUSED) only after coordinating with the BYB-2576
+      # Cloud Function — this trigger should REPLACE per-file job invocation, not run alongside it
+      # (otherwise you get both a per-file run AND the batched run). Tune the window to your SLA.
+      trigger:
+        pause_status: PAUSED
+        file_arrival:
+          url: ${var.prs_landing_zone}
+          min_time_between_triggers_seconds: 3600   # at most hourly → batch an hour of arrivals
+          wait_after_last_change_seconds: 300       # let a burst of arrivals settle before firing

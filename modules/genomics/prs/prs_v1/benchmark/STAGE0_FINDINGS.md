@@ -53,7 +53,11 @@ so more nodes just add distribution/coordination overhead with no parallelism to
 ## 4. Recommendations for the "big leagues"
 
 1. **Batch onboarding.** Score all pending new members in one run (≈45× cheaper/member than per-member).
-   Same for new PGS: register several, score in one pass.
+   Same for new PGS: register several, score in one pass. **Implemented**: the reconcile+scorer are
+   already batch (add_batch_x50 used the identical code path); the lever is the trigger, so
+   `prs_scoring.job.yml` now has a file-arrival trigger on `prs_landing_zone` that batches arrivals
+   (`min_time_between_triggers_seconds`/`wait_after_last_change_seconds`) — PAUSED until coordinated
+   with the BYB-2576 CF (which it should replace, not run alongside).
 2. **Right-size to single-node until data is genome-wide.** Workers only pay off once the *parallel* work
    (`task_s / cores`) exceeds the ~8s serial floor — i.e., when dosage is GBs, not MBs. At cohort/chr-scale
    the scorer is orchestration-bound; a single-node classic cluster wins. Re-run this curve at genome-wide
