@@ -26,6 +26,7 @@ dbutils.widgets.text("mode", "prep", "prep | score | full")
 dbutils.widgets.text("n_pgs", "5", "Synthetic PGS count (columns)")
 dbutils.widgets.text("density_pct", "60", "Percent of loci each PGS weights (0-100)")
 dbutils.widgets.text("max_loci", "50000", "Cap loci in prep (0 = all; start small, extrapolate $/cell)")
+dbutils.widgets.text("batch_n", "50", "Batch-onboarding size (score N new samples in ONE run)")
 dbutils.widgets.text("dbu_per_node_hr", "2.0", "DBU/hr per node (c3d-highmem-8 ~2; refine from billing)")
 dbutils.widgets.text("dollar_per_dbu", "0.15", "$/DBU (jobs compute; refine from billing)")
 
@@ -33,7 +34,7 @@ catalog = dbutils.widgets.get("catalog"); schema = dbutils.widgets.get("schema")
 source_dosage = dbutils.widgets.get("source_dosage")
 mode = dbutils.widgets.get("mode").strip().lower()
 n_pgs = int(dbutils.widgets.get("n_pgs")); density_pct = int(dbutils.widgets.get("density_pct"))
-max_loci = int(dbutils.widgets.get("max_loci"))
+max_loci = int(dbutils.widgets.get("max_loci")); batch_n = int(dbutils.widgets.get("batch_n"))
 dbu_per_node_hr = float(dbutils.widgets.get("dbu_per_node_hr")); dollar_per_dbu = float(dbutils.widgets.get("dollar_per_dbu"))
 
 # COMMAND ----------
@@ -53,6 +54,39 @@ def cluster_shape():
     return n_exec, cores
 
 def now(): return time.time()
+
+# --- Spark stage profiler (where compute goes): pull the driver's Spark REST API and diff the set
+# --- of COMPLETED stages across a phase, then aggregate task-time / scan / shuffle / spill / top ops.
+import requests
+def _stages_json():
+    try:
+        ui = spark.sparkContext.uiWebUrl; app = spark.sparkContext.applicationId
+        return requests.get(f"{ui}/api/v1/applications/{app}/stages?status=complete", timeout=60).json()
+    except Exception as e:
+        return {"_error": str(e)}
+
+def _stage_keys():
+    js = _stages_json()
+    return {(s["stageId"], s.get("attemptId", 0)) for s in js} if isinstance(js, list) else set()
+
+def _profile(before_keys):
+    js = _stages_json()
+    if not isinstance(js, list):
+        return {"_error": (js or {}).get("_error", "stages api unavailable")}
+    new = [s for s in js if (s["stageId"], s.get("attemptId", 0)) not in before_keys]
+    if not new:
+        return {"note": "no new completed stages"}
+    def g(s, k): return s.get(k, 0) or 0
+    top = sorted(new, key=lambda s: g(s, "executorRunTime"), reverse=True)[:3]
+    return {
+        "task_s": round(sum(g(s, "executorRunTime") for s in new) / 1000.0, 1),
+        "input_mb": round(sum(g(s, "inputBytes") for s in new) / 1e6, 1),
+        "shuffle_mb": round(sum(g(s, "shuffleReadBytes") + g(s, "shuffleWriteBytes") for s in new) / 1e6, 1),
+        "spill_mb": round(sum(g(s, "memoryBytesSpilled") + g(s, "diskBytesSpilled") for s in new) / 1e6, 1),
+        "n_stages": len(new), "n_tasks": sum(g(s, "numTasks") for s in new),
+        "top_ops": [{"name": (s.get("name", "") or "")[:60], "task_s": round(g(s, "executorRunTime") / 1000.0, 1),
+                     "shuffle_mb": round((g(s, "shuffleReadBytes") + g(s, "shuffleWriteBytes")) / 1e6, 1)} for s in top],
+    }
 
 # COMMAND ----------
 
@@ -209,12 +243,14 @@ RESULTS = []   # collected per-phase metrics; returned via notebook.exit for mac
 
 def run_phase(phase, mechanism="sql", sample_filter=None, pgs_filter=None):
     n_exec, cores = cluster_shape()
+    before = _stage_keys()                       # snapshot completed stages BEFORE the phase
     t0 = now()
     plan = reconcile(sample_filter=sample_filter, pgs_filter=pgs_filter)
     n_cells = plan.count()
     if n_cells > 0:
         score(plan)
     wall = now() - t0
+    prof = _profile(before)                      # diff completed stages -> where compute went
     n_dose = spark.table("dosage").count(); n_w = spark.table("pgs_weights").count()
     nodes = 1 + n_exec
     dbu = nodes * dbu_per_node_hr * (wall / 3600.0)
@@ -232,9 +268,10 @@ def run_phase(phase, mechanism="sql", sample_filter=None, pgs_filter=None):
     RESULTS.append({"phase": phase, "n_exec": n_exec, "cores": cores, "n_cells": n_cells,
                     "n_dosage_rows": n_dose, "n_weight_rows": n_w, "wall_clock_s": round(wall, 2),
                     "cells_per_s": round(cps, 1), "est_dbu": round(dbu, 4),
-                    "est_cost_usd": round(cost, 4), "dbu_per_cell": dpc})
-    print(f"[{phase}] cells={n_cells:,} wall={wall:.1f}s cells/s={cps:,.0f} "
-          f"nodes={nodes} est_cost=${cost:.4f} dbu/cell={dpc:.3e}")
+                    "est_cost_usd": round(cost, 4), "dbu_per_cell": dpc, "profile": prof})
+    print(f"[{phase}] cells={n_cells:,} wall={wall:.1f}s cells/s={cps:,.0f} nodes={nodes} "
+          f"est_cost=${cost:.4f} | task_s={prof.get('task_s')} input_mb={prof.get('input_mb')} "
+          f"shuffle_mb={prof.get('shuffle_mb')} spill_mb={prof.get('spill_mb')}")
     return wall, n_cells
 
 # COMMAND ----------
@@ -247,8 +284,8 @@ if mode in ("score", "full"):
     # Reset to the PREP baseline so every num_workers rung scores the identical grid (the add_pgs /
     # add_sample phases below mutate the bench; undo any prior run's increments first).
     base_ids = ", ".join(f"'BENCHPGS{k:03d}'" for k in range(n_pgs))
-    spark.sql("DELETE FROM dosage WHERE sample_id = 'BENCH_NEW_SAMPLE'")
-    spark.sql("DELETE FROM sample_ancestry WHERE sample_id = 'BENCH_NEW_SAMPLE'")
+    spark.sql("DELETE FROM dosage WHERE sample_id LIKE 'BENCH%'")          # add_sample + add_batch clones
+    spark.sql("DELETE FROM sample_ancestry WHERE sample_id LIKE 'BENCH%'")
     spark.sql(f"DELETE FROM pgs_weights WHERE pgs_id NOT IN ({base_ids})")
     spark.sql(f"DELETE FROM pgs_registry WHERE pgs_id NOT IN ({base_ids})")
     spark.sql(f"DELETE FROM pgs_panel_ref WHERE pgs_id NOT IN ({base_ids})")
@@ -288,6 +325,18 @@ if mode in ("score", "full"):
     spark.sql("INSERT INTO sample_ancestry VALUES ('BENCH_NEW_SAMPLE','European')")
     run_phase("add_sample")
 
+    # 3b) BATCH onboarding: add batch_n new samples, score them in ONE run. If wall ≈ one
+    #     add_sample (not batch_n × it), the ~fixed per-run floor is amortized across the batch.
+    base = spark.table("dosage").where(~F.col("sample_id").like("BENCH%")).select("sample_id").limit(1).collect()[0]["sample_id"]
+    ids_df = spark.createDataFrame([(f"BENCH_BATCH_{i:04d}",) for i in range(batch_n)], ["new_id"])
+    (spark.table("dosage").where(F.col("sample_id") == base)
+        .crossJoin(F.broadcast(ids_df))
+        .select(F.col("new_id").alias("sample_id"), "variant_id", "dose")
+     ).write.mode("append").saveAsTable("dosage")
+    (ids_df.select(F.col("new_id").alias("sample_id")).withColumn("most_similar_pop", F.lit("European"))
+     ).write.mode("append").saveAsTable("sample_ancestry")
+    run_phase(f"add_batch_x{batch_n}")
+
     # 4) RE-RUN: reconcile should find 0 cells (idempotent → no work)
     run_phase("rerun_idempotent")
 
@@ -296,4 +345,4 @@ if mode in ("score", "full"):
 
     import json as _json
     dbutils.notebook.exit(_json.dumps({"max_loci": max_loci, "n_pgs": n_pgs, "density_pct": density_pct,
-                                       "phases": RESULTS}))
+                                       "batch_n": batch_n, "phases": RESULTS}))
