@@ -20,8 +20,10 @@
 
 dbutils.widgets.text("catalog", "dev_exploration_sandbox", "Catalog")
 dbutils.widgets.text("schema", "prs_gw_bench", "Bench schema (scratch)")
-dbutils.widgets.text("synth_loci", "1000000", "Synthetic loci (≈ one genome-wide PGS)")
-dbutils.widgets.text("n_pgs", "1", "Synthetic PGS count")
+dbutils.widgets.text("synth_loci", "1000000", "Synthetic UNION loci (dosage width ≈ union of all PGS)")
+dbutils.widgets.text("n_pgs", "1", "Synthetic PGS count (output columns)")
+dbutils.widgets.text("weight_per_pgs", "480000", "Loci each PGS covers (n_pgs × this ≈ total weight rows)")
+dbutils.widgets.text("batch_n", "50", "At-scale onboarding batch (<=0 skips add_sample/batch phases)")
 dbutils.widgets.text("sample_ramp", "1,2,4,8,16,32,64,128", "Sample counts to ramp through")
 dbutils.widgets.text("max_minutes", "25", "GUARD: stop the ramp once cumulative wall exceeds this")
 dbutils.widgets.text("max_rows", "300000000", "GUARD: skip a rung whose dosage would exceed this many rows")
@@ -30,6 +32,7 @@ dbutils.widgets.text("dollar_per_dbu", "0.15", "$/DBU (refine from billing)")
 
 catalog = dbutils.widgets.get("catalog"); schema = dbutils.widgets.get("schema")
 synth_loci = int(dbutils.widgets.get("synth_loci")); n_pgs = int(dbutils.widgets.get("n_pgs"))
+weight_per_pgs = int(dbutils.widgets.get("weight_per_pgs")); batch_n = int(dbutils.widgets.get("batch_n"))
 ramp = [int(x) for x in dbutils.widgets.get("sample_ramp").split(",") if x.strip()]
 max_minutes = float(dbutils.widgets.get("max_minutes")); max_rows = int(dbutils.widgets.get("max_rows"))
 dbu_per_node_hr = float(dbutils.widgets.get("dbu_per_node_hr")); dollar_per_dbu = float(dbutils.widgets.get("dollar_per_dbu"))
@@ -87,9 +90,15 @@ spark.sql("CREATE TABLE stage0_gw_metrics (run_ts TIMESTAMP, phase STRING, n_sam
 # synthetic loci (variant_id) + weights + registry + panel — one PGS per n_pgs, deterministic weights
 loci = spark.range(synth_loci).select(F.concat_ws(":", F.lit("1"), (F.col("id") + 1).cast("string"), F.lit("A"), F.lit("G")).alias("variant_id"))
 loci.write.mode("overwrite").saveAsTable("_gw_loci")
+# Each PGS covers a hash-random ~weight_per_pgs subset of the union (models real PGS overlap, so
+# total weight rows ≈ n_pgs × weight_per_pgs rather than a dense n_pgs × synth_loci).
+dens_ppm = min(1_000_000, int(1_000_000 * weight_per_pgs / float(synth_loci)))  # coverage in parts-per-million
 wparts = []
 for k in range(n_pgs):
-    wparts.append(spark.table("_gw_loci")
+    base = spark.table("_gw_loci")
+    if dens_ppm < 1_000_000:
+        base = base.where((F.abs(F.hash(F.concat(F.col("variant_id"), F.lit(f"|{k}")))) % 1_000_000) < dens_ppm)
+    wparts.append(base
         .withColumn("pgs_id", F.lit(f"GWPGS{k:03d}")).withColumn("effect_allele", F.lit("A")).withColumn("other_allele", F.lit("G"))
         .withColumn("weight", ((F.abs(F.hash(F.concat(F.col("variant_id"), F.lit(f"w{k}")))) % 2000) - 1000) / 1000.0)
         .withColumn("weight_sha", F.lit(f"gwsha{k:03d}"))
@@ -201,12 +210,13 @@ for N in ramp:
     if (now() - cum0) / 60.0 > max_minutes:
         stopped = f"time guard: cumulative > {max_minutes} min"; break
 
-# At the largest reached scale, the onboarding metrics (prs_scores currently holds the last full backfill):
-if prev >= 1:
+# At the largest reached scale, the onboarding metrics (prs_scores currently holds the last full backfill).
+# Skipped when batch_n <= 0 (cheap intermediate loci-ramp steps only want the full-backfill cost).
+if prev >= 1 and batch_n > 0:
     build_samples(prev, prev + 1)                          # 1 brand-new sample
     run_phase("gw_add_sample", prev + 1)                   # ~1 cell; tests file-skip at genome-wide scale
-    build_samples(prev + 1, prev + 51)                     # 50 brand-new samples
-    run_phase("gw_add_batch_x50", prev + 51)               # tests batching at genome-wide scale
+    build_samples(prev + 1, prev + 1 + batch_n)            # batch_n brand-new samples
+    run_phase(f"gw_add_batch_x{batch_n}", prev + 1 + batch_n)   # tests batching at genome-wide scale
 
 print("\n=== stage0_gw_metrics ===")
 spark.table("stage0_gw_metrics").orderBy("run_ts").show(200, truncate=False)
