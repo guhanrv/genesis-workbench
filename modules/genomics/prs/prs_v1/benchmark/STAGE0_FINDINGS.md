@@ -109,6 +109,40 @@ in ~27s single-node and onboards a member in ~15s, no spill. The "big leagues" c
 matter) is beyond 128M compressible rows — reachable only with the full multi-PGS union (tens of millions
 of loci) and/or thousands of samples; that rung is a further gated step.
 
+## REAL extraction at scale (6 consented member WGS gVCFs)
+
+The pivot from synthetic scoring to the real cost driver. Ran the actual pysam extraction on 6 real
+WGS gVCFs (~200–300 MB each, on a UC Volume) against a genome-wide 1M-locus catalog, single-node
+8-core. (Extraction walk is gVCF-READ-bound — measured locally: walk@100k=37s vs walk@1M=42s — so a
+1M-locus catalog is representative of full genome-wide extraction *time*.)
+
+| phase | samples | mode | tasks | dosage rows | wall |
+|---|---|---|---|---|---|
+| full6 | 6 | sample | 6 | 5.62M | 134.8s |
+| full6 | 6 | **sharded (sample×chrom)** | 132 | 5.62M | **88.9s** |
+| onboard1 | 1 | sample | 1 | 928k | 61.2s |
+| onboard1 | 1 | **sharded** | 22 | 928k | **19.1s** |
+
+fasta-ref build = 31.5s one-time (reads the 842 MB FASTA from the Volume; amortized across all samples).
+Sharded and sample modes produce **identical row counts** → sharding is correct on-cluster.
+
+Findings:
+- **Extraction is I/O + BGZF-decompress bound on Volume gVCF reads** (~1 sample isolated = 61s ≈ 5 MB/s of
+  gVCF; local SSD was 40s — FUSE adds overhead). 6 concurrent sample-tasks on one node = 135s (worse than
+  the ~46s a compute-bound model predicts) → **contention** when many large concurrent reads hit one node's
+  FUSE mount.
+- **Chrom-sharding wins, biggest on onboarding**: add-one-member **61s → 19s (3.2×)** (22 chrom tasks spread
+  the single gVCF's decompress across cores + smaller reads reduce contention); full-6 **135s → 89s (1.5×)**.
+  This is the incremental path the design optimizes, so the onboarding win is the one that matters.
+- **Scaling lever = NODES** (FUSE bandwidth + cores), not just cores-per-node — extraction is
+  embarrassingly parallel across samples; add nodes to raise aggregate read bandwidth.
+- **Extraction (~1 core-min/sample) dominates; scoring is ~free.** This confirms the whole cost model:
+  extract once (~a minute/sample, sharded ~20s), reuse forever; the distributed scorer then costs cents.
+  End-to-end onboarding of a new member ≈ ~20s extract (sharded) + seconds to score.
+
+Rough cohort extrapolation: extraction wall ≈ N_samples × ~60 core-s / (cluster cores), I/O-contention
+capped per node → e.g. ~1000 members on ~8 nodes ≈ tens of minutes, once. Cheap, and paid once.
+
 ## Caveat — small-scale regime
 Every number here is the **cohort/chr-scale (MB) regime**, where the scorer is orchestration-bound and
 workers don't help. At **genome-wide scale (GB dosage, 48M-weight PGS that won't broadcast)** the profile
