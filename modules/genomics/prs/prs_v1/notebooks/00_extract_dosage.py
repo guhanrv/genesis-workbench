@@ -26,6 +26,7 @@ dbutils.widgets.text("vcf_paths", "", "Explicit gVCF paths (comma-sep; overrides
 dbutils.widgets.text("fasta_path", "", "GRCh38 FASTA (.fna.bgz) for REF-block resolution")
 dbutils.widgets.text("pgs_ids", "", "Restrict union to these PGS' variants (comma-sep; empty = all registered)")
 dbutils.widgets.text("reextract", "false", "true = re-extract samples already in dosage (needed after add-PGS)")
+dbutils.widgets.text("shard_by_chrom", "true", "Shard extraction (sample × chrom) — parallelizes each sample's walk across chroms")
 
 catalog = dbutils.widgets.get("catalog")
 schema = dbutils.widgets.get("schema")
@@ -53,6 +54,7 @@ vcf_paths_arg = dbutils.widgets.get("vcf_paths")
 fasta_path = dbutils.widgets.get("fasta_path")
 pgs_filter = [x.strip() for x in dbutils.widgets.get("pgs_ids").split(",") if x.strip()]
 reextract = dbutils.widgets.get("reextract").strip().lower() == "true"
+shard_by_chrom = dbutils.widgets.get("shard_by_chrom").strip().lower() == "true"
 
 spark.sql(f"USE CATALOG {catalog}")
 spark.sql(f"USE SCHEMA {schema}")
@@ -86,10 +88,17 @@ rows = [(r["chrom"], r["pos"], r["effect"], r["other"]) for r in uv.collect()]
 ucat = ext.build_union_catalog(rows)
 print(f"union catalog: {ucat.n_var} variants" + (f" (restricted to {pgs_filter})" if pgs_filter else ""))
 
-# precompute FASTA ref base per catalog position ONCE on the driver, broadcast the array
+# precompute FASTA ref base per catalog position ONCE on the driver (amortized across all samples)
 fasta_ref = kern.build_catalog_fasta_ref(ucat, fasta_path)
-UCAT_B = spark.sparkContext.broadcast(ucat)
-FASTA_B = spark.sparkContext.broadcast(fasta_ref)
+if shard_by_chrom:
+    # split by chrom → each (sample × chrom) task reads only that chrom's gVCF region (tabix),
+    # so a sample's genome-wide walk parallelizes across chroms/cores (big onboarding speedup).
+    BYCHROM_B = spark.sparkContext.broadcast(ext.split_catalog_by_chrom(ucat, fasta_ref))
+    catalog_chroms = sorted(BYCHROM_B.value.keys())
+    print(f"sharding by chrom: {len(catalog_chroms)} chroms")
+else:
+    UCAT_B = spark.sparkContext.broadcast(ucat)
+    FASTA_B = spark.sparkContext.broadcast(fasta_ref)
 
 # COMMAND ----------
 
@@ -134,21 +143,38 @@ OUT_SCHEMA = StructType([
     StructField("dose", DoubleType()),
 ])
 
-def _extract_partition(itr):
-    import prs_extract as _e, gvcf_dose as _k  # resolved from addPyFile on the executor
-    uc = UCAT_B.value
-    fa = FASTA_B.value
+def _extract_sample(itr):                       # one task per sample: whole-genome walk
+    import prs_extract as _e, gvcf_dose as _k    # resolved from addPyFile on the executor
+    uc = UCAT_B.value; fa = FASTA_B.value
     for pdf in itr:
         for _, r in pdf.iterrows():
             sid, dose_rows = _e.sample_dosage_rows(r["vcf_path"], uc, fa, kernel=_k)
             if dose_rows:
-                out = pd.DataFrame(dose_rows, columns=["variant_id", "dose"])
-                out.insert(0, "sample_id", sid)
+                out = pd.DataFrame(dose_rows, columns=["variant_id", "dose"]); out.insert(0, "sample_id", sid)
                 yield out
 
-n_tasks = max(1, len(manifest))
-mdf = spark.createDataFrame(manifest, ["sample_id", "vcf_path"]).repartition(n_tasks)
-extracted = mdf.mapInPandas(_extract_partition, schema=OUT_SCHEMA)
+def _extract_sample_chrom(itr):                  # one task per (sample × chrom): reads only that chrom's region
+    import prs_extract as _e, gvcf_dose as _k
+    bc = BYCHROM_B.value
+    for pdf in itr:
+        for _, r in pdf.iterrows():
+            ch, pos, eff, oth, vid, fa = bc[r["chrom"]]
+            sub = _e.UnionCatalog(ch, pos, eff, oth, vid)   # rebuild from broadcast plain arrays
+            sid, dose_rows = _e.sample_dosage_rows(r["vcf_path"], sub, fa, kernel=_k)
+            if dose_rows:
+                out = pd.DataFrame(dose_rows, columns=["variant_id", "dose"]); out.insert(0, "sample_id", sid)
+                yield out
+
+if shard_by_chrom:
+    tasks = [(sid, p, ch) for (sid, p) in manifest for ch in catalog_chroms]
+    n_tasks = max(1, len(tasks))
+    mdf = spark.createDataFrame(tasks, ["sample_id", "vcf_path", "chrom"]).repartition(n_tasks)
+    extracted = mdf.mapInPandas(_extract_sample_chrom, schema=OUT_SCHEMA)
+    print(f"distributing {len(manifest)} sample(s) × {len(catalog_chroms)} chrom = {n_tasks} tasks")
+else:
+    n_tasks = max(1, len(manifest))
+    mdf = spark.createDataFrame(manifest, ["sample_id", "vcf_path"]).repartition(n_tasks)
+    extracted = mdf.mapInPandas(_extract_sample, schema=OUT_SCHEMA)
 
 # stage then MERGE (idempotent on (sample_id, variant_id))
 extracted.write.mode("overwrite").option("overwriteSchema", "true").saveAsTable("_dosage_stage")

@@ -69,6 +69,23 @@ def dense_fill(dose: np.ndarray, had_record: np.ndarray, af_effect) -> np.ndarra
     return out
 
 
+def split_catalog_by_chrom(ucat, fasta_ref):
+    """Split a UnionCatalog (+ its fasta_ref array) into per-chrom plain-array bundles, for
+    ``(sample × chrom)`` sharded extraction: each shard reads only one chromosome's gVCF region
+    (tabix random-access), so a single sample's genome-wide walk parallelizes across chroms/cores
+    — a ~22× within-sample speedup that matters most for onboarding (few samples vs many cores).
+
+    Returns ``{chrom: (chrom, pos, effect, other, variant_id, fasta_ref)}`` as plain numpy arrays
+    (broadcast-safe — no custom-class unpickling on executors; rebuild ``UnionCatalog`` in-task).
+    """
+    fr = np.asarray(fasta_ref)
+    out = {}
+    for ch in sorted(set(ucat.chrom.tolist())):
+        m = ucat.chrom == ch
+        out[str(ch)] = (ucat.chrom[m], ucat.pos[m], ucat.effect[m], ucat.other[m], ucat.variant_id[m], fr[m])
+    return out
+
+
 def sample_dosage_rows(vcf_path, ucat, fasta_ref_arr, kernel):
     """One sample's dosage rows for the ``dosage`` store, via the gVCF kernel.
 
