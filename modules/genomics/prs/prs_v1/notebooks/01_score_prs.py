@@ -100,10 +100,10 @@ raw = (raw.join(nvar, "pgs_id", "left")
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ### 2. Reference-panel normalization — z_msp/percentile_msp against the FROZEN panel (per sample's MSP)
-# MAGIC `sample_ancestry` (from the PCA module: sample_id → most_similar_pop) picks which panel superpop row to
-# MAGIC standardize against. Frozen panel ⇒ a new sample's z needs no cohort re-rank. (Admixed PRSmix+ z is a
-# MAGIC documented follow-up — needs the RF-posterior weighting from `_admixed_score`.)
+# MAGIC ### 2. Reference-panel normalization — z_msp (single MSP) + z_admixed (RF-posterior-weighted)
+# MAGIC `sample_ancestry` (from the ancestry module) gives `most_similar_pop` → the panel superpop row to
+# MAGIC standardize against (`z_msp`), plus `rf_probs` → the continuous-ancestry `z_admixed`. Frozen panel ⇒
+# MAGIC a new sample's z needs no cohort re-rank.
 
 # COMMAND ----------
 
@@ -126,14 +126,38 @@ def _norm_cdf_pct(z):
 
 scored = scored.withColumn("percentile_msp", _norm_cdf_pct(F.col("z_msp")))
 
-# registry metadata + result columns (admixed/clinical/concordance left null here — later stages fill them)
+# ── z_admixed — continuous-ancestry (PRSmix-style) normalization ─────────────────────────────
+# Standardize raw against EACH panel superpop's distribution and weight by the RF ancestry
+# posterior (rf_probs, persisted by 05_build_sample_ancestry):  z_admixed = Σ_pop P_RF(pop)·z_pop.
+# Uses the SAME PGS + the existing pgs_panel_ref (per-superpop mean/sd), so it needs no bespoke
+# per-ancestry PGS catalog. For a non-admixed sample (RF ~1.0 on its MSP) it collapses to z_msp;
+# for an admixed sample it blends the superpop references. Degenerate rows (sd=0 / prob=0) drop and
+# the surviving weights renormalize (mass redistribution) — matching function_prs._admixed_score.
+# (PRSmix+ with DISTINCT per-ancestry PGS variants + MyOme β/caPRS weighting is a curation-heavy
+#  extension deliberately left out of the core scorer.)
+probs = (spark.table("sample_ancestry")
+         .select("sample_id", F.from_json(F.col("rf_probs"), "map<string,double>").alias("_p"))
+         .select("sample_id", F.explode("_p").alias("superpop", "prob")))
+ref_all = spark.table("pgs_panel_ref").select(
+    "pgs_id", "superpop", "panel_version", F.col("mean").alias("amean"), F.col("sd").alias("asd"))
+adm = (
+    raw.select("sample_id", "pgs_id", "panel_version", "raw_score")
+    .join(probs, "sample_id")
+    .join(ref_all, ["pgs_id", "superpop", "panel_version"])
+    .where((F.col("asd") > 0) & (F.col("prob") > 0))
+    .withColumn("z_anc", (F.col("raw_score") - F.col("amean")) / F.col("asd"))
+    .groupBy("sample_id", "pgs_id")
+    .agg((F.sum(F.col("prob") * F.col("z_anc")) / F.sum(F.col("prob"))).alias("z_admixed"))
+)
+scored = (scored.join(adm, ["sample_id", "pgs_id"], "left")
+          .withColumn("percentile_admixed", _norm_cdf_pct(F.col("z_admixed"))))
+
+# registry metadata + result columns (clinical/concordance left null here — later stages fill them)
 reg = spark.table("pgs_registry").select("pgs_id", "score_id", "disease", "direction", "hr_per_sd", "clinical_model")
 out = (
     scored.join(reg, "pgs_id", "left")
     .withColumn("used_ancestry", F.col("msp"))
-    .withColumn("z_admixed", F.lit(None).cast("double"))
-    .withColumn("percentile_admixed", F.lit(None).cast("double"))
-    .withColumn("integrated_z_source", F.lit("msp"))
+    .withColumn("integrated_z_source", F.when(F.col("z_admixed").isNotNull(), F.lit("admixed")).otherwise(F.lit("msp")))
     .withColumn("integrated_risk_10yr", F.lit(None).cast("double"))
     .withColumn("clinical_risk_10yr", F.lit(None).cast("double"))
     .withColumn("risk_category", F.lit(None).cast("string"))
