@@ -83,12 +83,14 @@ parquet_local = os.path.join(local, "GRCh38_HGDP+1kGP_ALL.pvar.parquet")
 pvar.to_parquet(parquet_local, index=False)
 print(f"built pvar.parquet server-side: {len(pvar):,} variants")
 
-# 4. copy pgen + psam + the derived parquet to the Volume via FUSE (sequential — handles large files)
+# 4. copy pgen + psam + the derived parquet to the Volume via dbutils.fs.cp (reliable for large
+#    files → Volumes; plain shutil.copyfile over the FUSE mount stalls on the 12 GB pgen).
 os.makedirs(dest, exist_ok=True)
 for base in list(TO_VOLUME) + ["GRCh38_HGDP+1kGP_ALL.pvar.parquet"]:
     src = os.path.join(local, base); dst = os.path.join(dest, base)
-    t = time.time(); shutil.copyfile(src, dst)
-    print(f"  {base}: {os.path.getsize(dst)/1e9:.2f} GB → {dst}  ({time.time()-t:.0f}s)")
+    t = time.time()
+    dbutils.fs.cp("file:" + src, dst)
+    print(f"  {base}: {os.path.getsize(src)/1e9:.2f} GB → {dst}  ({time.time()-t:.0f}s)")
 
 print("panel staged. Files on Volume:")
 for f in dbutils.fs.ls(dest):
