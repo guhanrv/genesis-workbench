@@ -5,14 +5,15 @@ resources:
 
       # ONE-TIME reference-artifact builders (run on demand, not per scoring run). Stages the pgsc
       # HGDP+1kGP panel to the prs_reference volume, then builds the frozen ancestry PCA basis and the
-      # panel allele-frequency table on top of it. All classic single-node (Glow-free but plink2/pgenlib);
-      # ephemeral (auto-terminate). These outputs (panel pgen, pca_basis.npz, pgs_panel_afreq) are the
-      # fixed references the scoring job consumes — build once, reuse across all scoring runs.
+      # panel allele-frequency table on top of it. Fully Spark-native — NO plink2 or other binaries
+      # (pgenlib for the pgen reads + distributed QC/LD-prune/PCA in Spark). Ephemeral (auto-terminate).
+      # These outputs (panel pgen, pca_basis.npz, pgs_panel_afreq) are the fixed references the scoring
+      # job consumes — build once, reuse across all scoring runs.
       #
       # NOTE: build_panel_afreq reads the registered `pgs_weights` (to know which variants to price), so
       #       run 00_register_catalog (via the prs_scoring job) at least once before it. build_pca_basis
-      #       needs the plink2 binary on the runner (plink2_path); if unavailable, build pca_basis.npz
-      #       locally and stage it to out_path instead — the artifact is identical (shared numpy fit).
+      #       reads the full panel pgen to QC — TITRATE prs_ref_cluster.num_workers up to parallelize the
+      #       blocked read for a faster one-time build.
 
       email_notifications:
         on_failure:
@@ -58,18 +59,18 @@ resources:
           default: /Volumes/${var.core_catalog_name}/${var.core_schema_name}/prs_reference/panel
         - name: panel_dir
           default: /Volumes/${var.core_catalog_name}/${var.core_schema_name}/prs_reference/panel
-        # PCA basis (00_build_pca_basis)
+        # PCA basis (00_build_pca_basis) — Spark-native, no plink2 (QC + windowed LD-prune + PCA in Spark)
         - name: out_path
           default: ${var.prs_pca_basis}
-        - name: high_ld_path        # stage the pgsc_calc high-LD-regions-hg38 file here
-          default: /Volumes/${var.core_catalog_name}/${var.core_schema_name}/prs_reference/high-LD-regions-hg38-GRCh38.txt
-        - name: plink2_path
-          default: plink2
+        - name: panel_psam
+          default: /Volumes/${var.core_catalog_name}/${var.core_schema_name}/prs_reference/panel/GRCh38_HGDP+1kGP_ALL.psam
+        - name: king_cutoff
+          default: /Volumes/${var.core_catalog_name}/${var.core_schema_name}/prs_reference/panel/GRCh38_HGDP+1kGP.king.cutoff.out.id
         - name: dim_ref
           default: "10"
         - name: panel_version
           default: pgsc_HGDP+1kGP_v1
-        # panel afreq (04_build_panel_afreq)
+        # panel pgen/pvar — shared by build_pca_basis (QC read) + build_panel_afreq
         - name: panel_pgen
           default: /Volumes/${var.core_catalog_name}/${var.core_schema_name}/prs_reference/panel/GRCh38_HGDP+1kGP_ALL.pgen
         - name: panel_pvar_parquet
@@ -78,7 +79,7 @@ resources:
           default: ""
 
       job_clusters:
-        - job_cluster_key: prs_ref_cluster       # panel download + plink2/pgenlib reference builds
+        - job_cluster_key: prs_ref_cluster       # panel download + pgenlib/Spark reference builds (no plink2)
           new_cluster:
             spark_version: 15.4.x-scala2.12
             node_type_id: ${var.cpu_node_type}

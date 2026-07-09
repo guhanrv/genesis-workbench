@@ -1,44 +1,43 @@
 # Databricks notebook source
 # MAGIC %md
-# MAGIC # Build the frozen FRAPOSA PCA basis (one-time reference; classic; NOT serverless)
+# MAGIC # Build the frozen FRAPOSA PCA basis — Spark-native, distributed (classic; NOT serverless)
 # MAGIC
-# MAGIC Produces `pca_basis.npz` — the fixed HGDP+1kGP PC basis that `05_build_sample_ancestry` projects
-# MAGIC members onto. This is the ancestry analogue of `pgs_panel_ref`/`pgs_panel_afreq`: a **one-time,
-# MAGIC self-regenerable reference artifact** built from the panel on the Volume (nothing depends on a local
-# MAGIC file). Mirrors pgsc_calc's reference build and `function_pca` bit-for-bit (the fit is the same numpy
-# MAGIC `prs_ancestry.fit_panel_basis` used in the validated local run: 47k loci, RF self-acc 1.0, LOO 60/60).
+# MAGIC Produces `pca_basis.npz` (the fixed HGDP+1kGP basis `05_build_sample_ancestry` projects members onto)
+# MAGIC **entirely in Spark — no plink2, no binaries.** This is the ancestry analogue of `pgs_panel_ref`: a
+# MAGIC one-time reference artifact, but now built with the same distributed-PCA pattern genesis's
+# MAGIC `pca_v1/01_compute_pca` and Databricks' `cspray` use (Spark ML PCA = a distributed sample-covariance
+# MAGIC eigendecomposition), plus a **Hail-style windowed-r² LD prune** done distributed (per chromosome).
 # MAGIC
-# MAGIC Pipeline (all on the driver — this is a fixed reference, not per-sample work):
-# MAGIC   1. plink2 QC the panel (pgsc_calc FILTER_VARIANTS defaults + `--remove king.cutoff` ⇒ the survivors
-# MAGIC      are the unrelated training set, so `sample_ancestry` needs no separate unrelated mask)
-# MAGIC   2. plink2 LD-prune (`--indep-pairwise 1000 50 0.05 --exclude range high-LD`) → fixed PCA loci
-# MAGIC   3. drop palindromic SNVs (pgsc_calc PCA_ELIGIBLE; also keeps panel/member reads consistent — the
-# MAGIC      member gVCF kernel drops palindromic too)
-# MAGIC   4. pgenlib reads panel ALT-dose at the loci → FRAPOSA fit → save loci + U/s/V/pcs_ref/mean/std +
-# MAGIC      panel IIDs + SuperPop labels to the Volume
-# MAGIC
-# MAGIC **Requires plink2 (v2.00a5+) on the runner.** Glow can't QC/LD-prune, so this classic step needs the
-# MAGIC plink2 binary staged on the cluster (`plink2_path` widget). If plink2 isn't available, run this once
-# MAGIC locally and stage the npz — the artifact is identical (the fit is the shared numpy lib).
+# MAGIC Pipeline (all distributed except the tiny driver-side eigendecomposition):
+# MAGIC   1. **QC read** — pgenlib reads the panel pgen in variant-index BLOCKS (`mapInPandas`), subsets to the
+# MAGIC      king.cutoff-unrelated samples, and keeps autosomal biallelic non-palindromic common SNVs
+# MAGIC      (MAF ≥ maf, missing ≤ geno). Writes per-variant dose arrays to a transient Delta table. pgenlib is
+# MAGIC      used ONLY here, in a simple blocked read — the heavy steps below never touch it.
+# MAGIC   2. **LD prune** — per chromosome (`applyInPandas`, distributed): sliding `window_bp` window; drop a
+# MAGIC      variant whose r² ≥ `r2` with an already-kept variant (greedy MIS, à la Hail `ld_prune` / plink2
+# MAGIC      `--indep-pairwise`), keeping the earlier/higher-MAF one.
+# MAGIC   3. **Fit** — standardize each pruned variant (per-variant mean/std, missing→0); accumulate the
+# MAGIC      panel Gram `G = Σ_v zᵥ zᵥᵀ` (= XᵀX, samples×samples) distributed via `treeReduce`; eigendecompose
+# MAGIC      on the driver (3,330² is trivial) → `V`, `s`. Derive per-variant loadings `U = z·V/s` distributed.
+# MAGIC      This reproduces `lib/prs_ancestry.fit_panel_basis` — so `project_member`/`classify` are unchanged.
+# MAGIC   4. **Persist** `pca_basis.npz` (loci, U, s, V, pcs_ref, mean, std, superpops) to the Volume.
 
 # COMMAND ----------
 
 dbutils.widgets.text("catalog", "genesis_workbench", "Catalog")
 dbutils.widgets.text("schema", "genesis_schema", "Schema")
-dbutils.widgets.text("panel_dir", "", "Volume dir with GRCh38_HGDP+1kGP_ALL.{pgen,pvar.zst,psam} + king.cutoff")
-dbutils.widgets.text("high_ld_path", "", "high-LD-regions-hg38-GRCh38.txt (Volume/workspace path)")
+dbutils.widgets.text("panel_pgen", "", "Panel .pgen path (Volume)")
+dbutils.widgets.text("panel_pvar_parquet", "", "Panel .pvar.parquet (CHROM,POS,REF,ALT in pgen order)")
+dbutils.widgets.text("panel_psam", "", "Panel .psam (IID + SuperPop)")
+dbutils.widgets.text("king_cutoff", "", "king.cutoff.out.id (related samples to exclude)")
 dbutils.widgets.text("out_path", "", "Volume path to write pca_basis.npz")
-dbutils.widgets.text("plink2_path", "plink2", "plink2 binary (v2.00a5+)")
 dbutils.widgets.text("dim_ref", "10", "Reference PC dimension (classify uses first 5)")
+dbutils.widgets.text("maf", "0.05", "Min MAF")
+dbutils.widgets.text("geno", "0.1", "Max per-variant missingness")
+dbutils.widgets.text("r2", "0.05", "LD-prune r² threshold (prune if ≥)")
+dbutils.widgets.text("window_bp", "1000000", "LD-prune window (bp)")
+dbutils.widgets.text("block_size", "20000", "pgenlib variants per QC-read task")
 dbutils.widgets.text("panel_version", "pgsc_HGDP+1kGP_v1", "Basis provenance tag")
-
-catalog = dbutils.widgets.get("catalog"); schema = dbutils.widgets.get("schema")
-panel_dir = dbutils.widgets.get("panel_dir").rstrip("/")
-high_ld_path = dbutils.widgets.get("high_ld_path").strip()
-out_path = dbutils.widgets.get("out_path").strip()
-plink2 = dbutils.widgets.get("plink2_path").strip()
-dim_ref = int(dbutils.widgets.get("dim_ref"))
-panel_version = dbutils.widgets.get("panel_version").strip()
 
 # COMMAND ----------
 
@@ -47,165 +46,232 @@ panel_version = dbutils.widgets.get("panel_version").strip()
 
 # COMMAND ----------
 
-import os, subprocess, time, gzip
+import os
 import numpy as np
+import pandas as pd
+import pyspark.sql.functions as F
+from pyspark.sql.types import (StructType, StructField, StringType, LongType, IntegerType,
+                               FloatType, ArrayType)
 
 catalog = dbutils.widgets.get("catalog"); schema = dbutils.widgets.get("schema")
-panel_dir = dbutils.widgets.get("panel_dir").rstrip("/")
-high_ld_path = dbutils.widgets.get("high_ld_path").strip()
-out_path = dbutils.widgets.get("out_path").strip()
-plink2 = dbutils.widgets.get("plink2_path").strip()
-dim_ref = int(dbutils.widgets.get("dim_ref"))
-panel_version = dbutils.widgets.get("panel_version").strip()
-assert panel_dir and out_path and high_ld_path, "panel_dir, high_ld_path, out_path are required"
+panel_pgen = dbutils.widgets.get("panel_pgen"); pvar_parquet = dbutils.widgets.get("panel_pvar_parquet")
+panel_psam = dbutils.widgets.get("panel_psam"); king_cutoff = dbutils.widgets.get("king_cutoff")
+out_path = dbutils.widgets.get("out_path"); dim_ref = int(dbutils.widgets.get("dim_ref"))
+MAF = float(dbutils.widgets.get("maf")); GENO = float(dbutils.widgets.get("geno"))
+R2 = float(dbutils.widgets.get("r2")); WINDOW_BP = int(dbutils.widgets.get("window_bp"))
+BLOCK = int(dbutils.widgets.get("block_size")); panel_version = dbutils.widgets.get("panel_version")
+assert panel_pgen and pvar_parquet and panel_psam and king_cutoff and out_path, "paths are required"
+spark.sql(f"USE CATALOG {catalog}"); spark.sql(f"USE SCHEMA {schema}")
+dim_stu = dim_ref * 2; dim_online = dim_stu * 2
 
-lib_dir = os.path.abspath(os.path.join(os.getcwd(), "..", "lib"))
-import sys; sys.path.append(lib_dir)
-import prs_ancestry as anc
+# COMMAND ----------
 
-# ── inlined driver-only readers (faithful copies from function_pca.refit; kept OUT of the shared
-#    prs_ancestry lib so that lib stays numpy-only-importable on executors — pgenlib lives only here) ──
+# MAGIC %md
+# MAGIC ### 1. Driver: unrelated-sample mask + SuperPop labels + pgen variant table
 
-def _read_text(path):
-    if path.endswith(".gz"):
-        with gzip.open(path, "rt") as f: return f.read()
-    if path.endswith(".zst"):
-        import zstandard
-        with open(path, "rb") as f:
-            return zstandard.ZstdDecompressor().decompress(f.read(), max_output_size=10 << 30).decode()
-    with open(path, "rt") as f: return f.read()
+# COMMAND ----------
 
-def _read_pgen_subset_by_id(pgen_prefix, variant_ids):
-    """Read named variants (by ID, caller order) from a pgen → (sample_ids, X (n_var, n_sam) ALT-dose,
-    NaN=missing). Direct port of function_pca.refit._read_pgen_subset_by_id."""
-    from pgenlib import PgenReader
-    psam_path = pgen_prefix + ".psam"
-    pvar_path = pgen_prefix + ".pvar" if os.path.exists(pgen_prefix + ".pvar") else pgen_prefix + ".pvar.zst"
-    sample_ids = []
-    with open(psam_path) as f:
-        header = f.readline().lstrip("#").rstrip("\n").split("\t"); iid_col = header.index("IID")
-        for line in f:
-            if line.strip(): sample_ids.append(line.rstrip("\n").split("\t")[iid_col])
-    id_to_idx = {}; id_col = 2; pgen_idx = 0
-    for line in _read_text(pvar_path).splitlines():
-        if line.startswith("##"): continue
-        if line.startswith("#"):
-            id_col = line.lstrip("#").split("\t").index("ID"); continue
-        parts = line.split("\t", id_col + 2); id_to_idx[parts[id_col]] = pgen_idx; pgen_idx += 1
-    n_pgen_var = pgen_idx
-    indices = np.empty(len(variant_ids), dtype=np.uint32); missing = []
-    for i, vid in enumerate(variant_ids):
-        idx = id_to_idx.get(vid)
-        if idx is None: missing.append(vid)
-        else: indices[i] = idx
-    if missing: raise KeyError(f"{len(missing)} variant IDs not in {os.path.basename(pvar_path)} (e.g. {missing[:3]})")
-    n_sam = len(sample_ids)
-    X = np.empty((len(variant_ids), n_sam), dtype=np.float32)
-    reader = PgenReader(str(pgen_prefix + ".pgen").encode(), raw_sample_ct=n_sam, variant_ct=n_pgen_var)
-    try: reader.read_dosages_list(indices, X, sample_maj=0)
-    finally: reader.close()
-    X[X < -0.5] = np.nan
-    return sample_ids, X
+# psam (all pgen samples, in order) → IID + SuperPop; king.cutoff → related IIDs to drop.
+psam = pd.read_csv(panel_psam, sep="\t")
+psam.columns = [c.lstrip("#") for c in psam.columns]
+all_iids = psam["IID"].astype(str).tolist()
+sp_by_iid = dict(zip(psam["IID"].astype(str), psam["SuperPop"].astype(str)))
+related = set()
+with open(king_cutoff) as f:
+    for line in f:
+        parts = line.rstrip("\n").split("\t")
+        related.add(parts[-1] if len(parts) > 1 else parts[0])   # IID column (last)
+unrel_pos = np.array([i for i, s in enumerate(all_iids) if s not in related], dtype=np.int64)
+unrel_iids = [all_iids[i] for i in unrel_pos]
+superpops = np.array([sp_by_iid[s] for s in unrel_iids])
+n_panel = len(unrel_iids); n_all = len(all_iids)
+uniq, cnts = np.unique(superpops, return_counts=True)
+print(f"panel: {n_all} total, {n_panel} unrelated | { {k: int(v) for k, v in zip(uniq, cnts)} }")
+
+# pgen variant table (pgen order) — CHROM already 'chr'-stripped in the parquet.
+pvar = spark.read.parquet(pvar_parquet).toPandas()
+pvar["vidx"] = np.arange(len(pvar), dtype=np.int64)
+n_pgen = len(pvar)
+print(f"pgen variants: {n_pgen}")
+
+PGEN_B = spark.sparkContext.broadcast(panel_pgen)
+UNREL_B = spark.sparkContext.broadcast(unrel_pos)
+# broadcast pgen-ordered chrom/pos/ref/alt for the QC-read tasks
+PV_B = spark.sparkContext.broadcast({
+    "chrom": pvar["CHROM"].astype(str).to_numpy(), "pos": pvar["POS"].to_numpy(np.int64),
+    "ref": pvar["REF"].astype(str).to_numpy(), "alt": pvar["ALT"].astype(str).to_numpy()})
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### 2. Distributed QC read (pgenlib blocks → transient Delta of per-variant dose arrays)
+
+# COMMAND ----------
 
 _PAL = ({"A", "T"}, {"C", "G"})
-def _palindromic(r, a): return {r.upper(), a.upper()} in _PAL
+QC_SCHEMA = StructType([
+    StructField("vidx", LongType()), StructField("chrom", StringType()), StructField("pos", LongType()),
+    StructField("ref", StringType()), StructField("alt", StringType()),
+    StructField("dose", ArrayType(FloatType())),   # length n_panel (unrelated), NaN = missing
+])
+
+def _qc_block(itr):
+    import numpy as _np
+    from pgenlib import PgenReader
+    pv = PV_B.value; unrel = UNREL_B.value; n_all_ = None
+    rd = PgenReader(PGEN_B.value.encode())
+    n_all_ = rd.get_raw_sample_ct()
+    try:
+        for pdf in itr:
+            for _, row in pdf.iterrows():
+                start = int(row["start"]); stop = min(start + BLOCK, n_pgen)
+                buf = _np.empty((stop - start, n_all_), dtype=_np.float32)
+                rd.read_dosages_range(start, stop, buf, sample_maj=0)
+                buf = buf[:, unrel]                     # subset to unrelated samples
+                buf[buf < -0.5] = _np.nan
+                out = []
+                for k in range(stop - start):
+                    gi = start + k
+                    c = str(pv["chrom"][gi]); r = str(pv["ref"][gi]); a = str(pv["alt"][gi])
+                    if not c.isdigit() or int(c) < 1 or int(c) > 22:      # autosome
+                        continue
+                    if len(r) != 1 or len(a) != 1:                        # biallelic SNV
+                        continue
+                    if {r.upper(), a.upper()} in _PAL:                    # non-palindromic
+                        continue
+                    d = buf[k]; valid = ~_np.isnan(d)
+                    nv = int(valid.sum())
+                    if nv == 0 or (1 - nv / len(d)) > GENO:               # missingness
+                        continue
+                    af = float(d[valid].sum()) / (2.0 * nv)
+                    if min(af, 1 - af) < MAF:                             # MAF
+                        continue
+                    out.append((gi, c, int(pv["pos"][gi]), r, a, [float(x) for x in d]))
+                if out:
+                    yield pd.DataFrame(out, columns=["vidx", "chrom", "pos", "ref", "alt", "dose"])
+    finally:
+        rd.close()
+
+blocks = spark.createDataFrame(
+    [(s,) for s in range(0, n_pgen, BLOCK)], ["start"]).repartition(max(1, n_pgen // BLOCK))
+qc = blocks.mapInPandas(_qc_block, schema=QC_SCHEMA)
+qc.write.mode("overwrite").option("overwriteSchema", "true").saveAsTable("_pca_qc_dose")
+qc = spark.table("_pca_qc_dose")
+print(f"QC-passing variants: {qc.count()}")
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ### 1. Stage panel to local NVMe (plink2 + pgenlib want local random-access files)
+# MAGIC ### 3. Distributed LD prune (per chromosome; Hail-style windowed greedy r²)
 
 # COMMAND ----------
 
-local = "/local_disk0/pca_panel"; os.makedirs(local, exist_ok=True)
-PANEL = "GRCh38_HGDP+1kGP_ALL"; KING = "GRCh38_HGDP+1kGP.king.cutoff.out.id"
-for base in (f"{PANEL}.pgen", f"{PANEL}.pvar.zst", f"{PANEL}.psam", KING):
-    dst = os.path.join(local, base)
-    if not os.path.exists(dst):
-        t = time.time(); dbutils.fs.cp(f"{panel_dir}/{base}", "file:" + dst)
-        print(f"  staged {base} ({os.path.getsize(dst)/1e9:.2f} GB) in {time.time()-t:.0f}s")
-local_high_ld = "/local_disk0/high-LD-regions.txt"
-dbutils.fs.cp(high_ld_path, "file:" + local_high_ld)
-panel_prefix = os.path.join(local, PANEL)
+PRUNE_SCHEMA = StructType([
+    StructField("vidx", LongType()), StructField("chrom", StringType()),
+    StructField("pos", LongType()), StructField("ref", StringType()), StructField("alt", StringType())])
 
-# COMMAND ----------
+def _prune_chrom(pdf):
+    import numpy as _np
+    from bisect import bisect_left
+    pdf = pdf.sort_values("pos")
+    pos = pdf["pos"].to_numpy()
+    D = _np.asarray(pdf["dose"].tolist(), dtype=_np.float32)     # (m, n_panel)
+    mean = _np.nanmean(D, 1, keepdims=True); sd = _np.nanstd(D, 1, keepdims=True); sd[sd == 0] = 1
+    Z = _np.nan_to_num((D - mean) / sd).astype(_np.float32); inv = 1.0 / D.shape[1]
+    kpos, kidx = [], []
+    keep = _np.zeros(len(pdf), dtype=bool)
+    for i in range(len(pdf)):
+        lo = bisect_left(kpos, pos[i] - WINDOW_BP)
+        if lo < len(kidx):
+            r2 = (Z[kidx[lo:]].astype(_np.float64) @ Z[i].astype(_np.float64) * inv) ** 2
+            if (r2 >= R2).any():
+                continue
+        kpos.append(int(pos[i])); kidx.append(i); keep[i] = True
+    out = pdf.loc[keep, ["vidx", "chrom", "pos", "ref", "alt"]]
+    return out
 
-# MAGIC %md
-# MAGIC ### 2. plink2 QC (pgsc_calc FILTER_VARIANTS + --remove king.cutoff) then LD-prune
-
-# COMMAND ----------
-
-qc = os.path.join(local, "panel_qc")
-if not os.path.exists(qc + ".pgen"):
-    t = time.time()
-    subprocess.run([plink2, "--pfile", panel_prefix, "vzs",
-                    "--remove", os.path.join(local, KING),
-                    "--max-alleles", "2", "--snps-only", "just-acgt", "--rm-dup", "exclude-all",
-                    "--autosome", "--maf", "0.05", "--hwe", "0.0001", "--geno", "0.1", "--mind", "0.1",
-                    "--make-pgen", "vzs", "--freq", "zs", "--threads", "8", "--out", qc],
-                   check=True, capture_output=True)
-    print(f"QC: {time.time()-t:.0f}s")
-
-pruned = os.path.join(local, "panel_pruned")
-t = time.time()
-subprocess.run([plink2, "--pfile", qc, "vzs", "--indep-pairwise", "1000", "50", "0.05",
-                "--exclude", "range", local_high_ld, "--threads", "8", "--out", pruned],
-               check=True, capture_output=True)
-prune_in = open(pruned + ".prune.in").read().split()
-print(f"LD-prune: {time.time()-t:.0f}s | {len(prune_in)} loci")
+kept = qc.groupBy("chrom").applyInPandas(_prune_chrom, schema=PRUNE_SCHEMA)
+kept = kept.orderBy(F.col("chrom").cast("int"), "pos")            # stable variant order
+kept_pd = kept.toPandas()
+n_var = len(kept_pd)
+order_by_vidx = {int(v): i for i, v in enumerate(kept_pd["vidx"].tolist())}
+ORDER_B = spark.sparkContext.broadcast(order_by_vidx)
+print(f"pruned loci: {n_var}")
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ### 3. Drop palindromic → read panel ALT-dose → FRAPOSA fit → save to Volume
+# MAGIC ### 4. Fit — distributed Gram (XᵀX) → driver eigendecomposition → distributed loadings
 
 # COMMAND ----------
 
-id2key = {}
-for line in _read_text(qc + ".pvar.zst").splitlines():
-    if line.startswith("#"): continue
-    p = line.split("\t"); id2key[p[2]] = (p[0], int(p[1]), p[3], p[4])   # #CHROM POS ID REF ALT
-loci_ids, loci = [], []
-for vid in prune_in:
-    c, pos, r, a = id2key[vid]
-    if _palindromic(r, a): continue
-    loci_ids.append(vid); loci.append((c, pos, r, a))
-print(f"loci after palindromic drop: {len(loci)} (dropped {len(prune_in) - len(loci)})")
+# kept dose only (join pruned vidx back to the QC dose)
+kept_dose = qc.join(F.broadcast(kept.select("vidx")), "vidx").select("vidx", "dose")
 
-t = time.time()
-panel_iids, X = _read_pgen_subset_by_id(qc, loci_ids)
-print(f"panel dose: {X.shape} in {time.time()-t:.0f}s (missing frac {np.isnan(X).mean():.4f})")
+def _std(d):
+    z = np.asarray(d, dtype=np.float64)
+    m = np.nanmean(z); s = np.nanstd(z)
+    if not (s > 0):
+        s = 1.0
+    z = (z - m) / s
+    z[np.isnan(z)] = 0.0
+    return z, float(m), float(s)
 
-# SuperPop labels aligned to panel_iids (from the FULL panel psam)
-hdr = open(panel_prefix + ".psam").readline().lstrip("#").rstrip().split("\t")
-iid_c, sp_c = hdr.index("IID"), hdr.index("SuperPop")
-sp_map = {}
-with open(panel_prefix + ".psam") as f:
-    f.readline()
-    for line in f:
-        p = line.rstrip().split("\t"); sp_map[p[iid_c]] = p[sp_c]
-superpops = np.array([sp_map[i] for i in panel_iids])
-uniq, cnts = np.unique(superpops, return_counts=True)
-print(f"panel (post-QC, unrelated): {len(panel_iids)} samples | { {k: int(v) for k, v in zip(uniq, cnts)} }")
+# 4a. Gram G = Σ_v zᵥ zᵥᵀ (n_panel × n_panel) via treeReduce over kept dose rows.
+def _part_gram(rows):
+    G = np.zeros((n_panel, n_panel), dtype=np.float64)
+    for r in rows:
+        z, _, _ = _std(r["dose"]); G += np.outer(z, z)
+    yield G
 
-basis = anc.fit_panel_basis(X, dim_ref=dim_ref)   # standardizes X in place
-# quick self-check: RF training accuracy on the panel PCs (should be ~1.0 if PCs separate superpops)
-clf, _cov = anc.fit_rf(basis["pcs_ref"], superpops.tolist(), n_pcs=5)
-print(f"RF self-accuracy on panel PCs: {(clf.predict(basis['pcs_ref'][:, :5]) == superpops).mean():.3f}")
+G = kept_dose.select("dose").rdd.mapPartitions(_part_gram).treeReduce(lambda a, b: a + b, depth=3)
+ssq, V = np.linalg.eigh(G)                       # ascending
+s_all = np.sqrt(np.abs(ssq))[::-1]               # descending
+V_all = V.T[::-1].T
+s_on = s_all[:dim_online]; V_on = V_all[:, :dim_online]          # (n_panel × dim_online)
+pcs_ref = (V_all[:, :dim_ref] * s_all[:dim_ref])                 # (n_panel × dim_ref)
+VS_B = spark.sparkContext.broadcast(V_on / s_on)                 # (n_panel × dim_online) for loadings
+print(f"eigendecomposition: top s = {np.round(s_on[:dim_ref], 1)}")
+
+# 4b. per-variant mean/std + loadings U = z·(V_on/s_on), tagged with stable order.
+LOAD_SCHEMA = StructType([
+    StructField("ord", IntegerType()), StructField("mean", FloatType()), StructField("std", FloatType()),
+    StructField("u", ArrayType(FloatType()))])
+
+def _loadings(itr):
+    vs = VS_B.value; ordr = ORDER_B.value
+    for pdf in itr:
+        rows = []
+        for _, r in pdf.iterrows():
+            z, m, sd = _std(r["dose"])
+            u = z @ vs                                # (dim_online,)
+            rows.append((int(ordr[int(r["vidx"])]), float(m), float(sd), [float(x) for x in u]))
+        if rows:
+            yield pd.DataFrame(rows, columns=["ord", "mean", "std", "u"])
+
+load = kept_dose.mapInPandas(_loadings, schema=LOAD_SCHEMA).toPandas().sort_values("ord")
+assert len(load) == n_var, f"loadings {len(load)} != loci {n_var}"
+U_on = np.asarray(load["u"].tolist(), dtype=np.float64)          # (n_var × dim_online)
+mean = load["mean"].to_numpy(np.float64).reshape(-1, 1)
+std = load["std"].to_numpy(np.float64).reshape(-1, 1)
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### 5. Persist pca_basis.npz (same shape as lib/prs_ancestry.fit_panel_basis output)
 
 # COMMAND ----------
 
 local_npz = "/local_disk0/pca_basis.npz"
 np.savez(local_npz,
-         loci_chrom=np.array([c for c, _, _, _ in loci]),
-         loci_pos=np.array([p for _, p, _, _ in loci], dtype=np.int64),
-         loci_ref=np.array([r for _, _, r, _ in loci]),
-         loci_alt=np.array([a for _, _, _, a in loci]),
-         U_on=basis["U_on"], s_on=basis["s_on"], V_on=basis["V_on"],
-         pcs_ref=basis["pcs_ref"], mean=basis["mean"], std=basis["std"],
-         dim_ref=basis["dim_ref"], dim_stu=basis["dim_stu"],
-         panel_iids=np.array(panel_iids), superpops=superpops,
-         panel_version=np.array(panel_version))
+         loci_chrom=kept_pd["chrom"].astype(str).to_numpy(),
+         loci_pos=kept_pd["pos"].to_numpy(np.int64),
+         loci_ref=kept_pd["ref"].astype(str).to_numpy(),
+         loci_alt=kept_pd["alt"].astype(str).to_numpy(),
+         U_on=U_on, s_on=s_on, V_on=V_on, pcs_ref=pcs_ref, mean=mean, std=std,
+         dim_ref=dim_ref, dim_stu=dim_stu,
+         panel_iids=np.array(unrel_iids), superpops=superpops, panel_version=np.array(panel_version))
 dbutils.fs.cp("file:" + local_npz, out_path)
-print(f"wrote basis → {out_path} ({os.path.getsize(local_npz)/1e6:.1f} MB) | "
-      f"n_loci={len(loci)} n_panel={len(panel_iids)} panel_version={panel_version}")
+spark.sql("DROP TABLE IF EXISTS _pca_qc_dose")
+print(f"wrote basis → {out_path} | n_loci={n_var} n_panel={n_panel} "
+      f"dim_online={dim_online} panel_version={panel_version}")

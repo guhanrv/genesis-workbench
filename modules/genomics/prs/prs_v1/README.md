@@ -54,7 +54,7 @@ setup_stores → register → extract_dosage → reconcile ───────
 
 ## Companion jobs
 
-- **`prs_reference_setup`** — one-time reference builders (run on demand): `00_download_panel` → `00_build_pca_basis` (`pca_basis.npz`) + `04_build_panel_afreq` (`pgs_panel_afreq`). `00_download_pgs_scorefile` runs in `prs_initial_setup_job`.
+- **`prs_reference_setup`** — one-time reference builders (run on demand): `00_download_panel` → `00_build_pca_basis` (`pca_basis.npz`) + `04_build_panel_afreq` (`pgs_panel_afreq`). `00_build_pca_basis` is **Spark-native (no plink2)**: distributed QC + Hail-style windowed-r² LD-prune + distributed sample-covariance eigendecomposition (the `pca_v1/01_compute_pca` / Databricks `cspray` pattern), reproducing `lib/prs_ancestry.fit_panel_basis`. `00_download_pgs_scorefile` runs in `prs_initial_setup_job`.
 - **`prs_maintenance`** — scheduled (paused) `03_maintain_stores`: OPTIMIZE + VACUUM + ANALYZE so MERGE versioning doesn't balloon.
 
 ## Key parameters (`prs_scoring`)
