@@ -38,12 +38,12 @@ step-1's `$/cell` and **approved separately** — never run blind.
 ## How to run a rung (copy-paste; requires go-ahead)
 ```bash
 # import the harness once
-databricks -p dev-exploration workspace import \
+databricks -p <profile> workspace import \
   --file benchmark/stage0_scorer_benchmark.py --language PYTHON --format SOURCE --overwrite \
   /Users/<you>/stage0_scorer_benchmark
 
 # STEP 0 — prep once (single-node). STEP 1+ — mode=score, bump num_workers each rung.
-databricks -p dev-exploration api post /api/2.1/jobs/runs/submit --json '{
+databricks -p <profile> api post /api/2.1/jobs/runs/submit --json '{
   "run_name": "stage0_prep",
   "tasks": [{"task_key":"s0","notebook_task":{
       "notebook_path":"/Users/<you>/stage0_scorer_benchmark",
@@ -58,7 +58,7 @@ databricks -p dev-exploration api post /api/2.1/jobs/runs/submit --json '{
 ## Reading the result
 ```sql
 SELECT phase, n_exec, cores, n_cells, wall_clock_s, cells_per_s, est_cost_usd, dbu_per_cell
-FROM   dev_exploration_sandbox.prs_stage0_bench.stage0_metrics ORDER BY run_ts;
+FROM   <catalog>.prs_stage0_bench.stage0_metrics ORDER BY run_ts;
 ```
 Decide from the numbers:
 - **Cluster size** = the smallest `n_exec` where `cells_per_s` stops improving materially (knee of the curve).
@@ -69,7 +69,7 @@ Decide from the numbers:
 
 ## Teardown (after the decision)
 ```sql
-DROP SCHEMA IF EXISTS dev_exploration_sandbox.prs_stage0_bench CASCADE;
+DROP SCHEMA IF EXISTS <catalog>.prs_stage0_bench CASCADE;
 ```
 Keep it only while iterating on the ladder; the `stage0_metrics` numbers are what matter — copy them out first.
 

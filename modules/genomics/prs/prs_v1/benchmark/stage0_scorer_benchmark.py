@@ -19,9 +19,9 @@
 
 # COMMAND ----------
 
-dbutils.widgets.text("catalog", "dev_exploration_sandbox", "Catalog")
+dbutils.widgets.text("catalog", "genesis_workbench", "Catalog")
 dbutils.widgets.text("schema", "prs_stage0_bench", "Bench schema (scratch)")
-dbutils.widgets.text("source_dosage", "dev_exploration_sandbox.genesis_workbench.pca_dosage_e0cbd8839f114af595973ab9c49e2214", "Wide dosage to explode")
+dbutils.widgets.text("source_dosage", "", "Wide dosage table to explode (fully-qualified; required)")
 dbutils.widgets.text("mode", "prep", "prep | score | full")
 dbutils.widgets.text("n_pgs", "5", "Synthetic PGS count (columns)")
 dbutils.widgets.text("density_pct", "60", "Percent of loci each PGS weights (0-100)")

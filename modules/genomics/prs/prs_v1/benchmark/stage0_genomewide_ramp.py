@@ -18,7 +18,7 @@
 
 # COMMAND ----------
 
-dbutils.widgets.text("catalog", "dev_exploration_sandbox", "Catalog")
+dbutils.widgets.text("catalog", "genesis_workbench", "Catalog")
 dbutils.widgets.text("schema", "prs_gw_bench", "Bench schema (scratch)")
 dbutils.widgets.text("synth_loci", "1000000", "Synthetic UNION loci (dosage width ≈ union of all PGS)")
 dbutils.widgets.text("n_pgs", "1", "Synthetic PGS count (output columns)")

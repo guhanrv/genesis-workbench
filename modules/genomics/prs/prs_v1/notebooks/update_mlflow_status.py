@@ -13,6 +13,11 @@ dbutils.widgets.text("job_status", "failed", "Job Status")
 mlflow_run_id = dbutils.widgets.get("mlflow_run_id")
 job_status = dbutils.widgets.get("job_status")
 
+# No-op when no run id is supplied (e.g. a manual/ad-hoc job run not launched via the
+# framework's batch-model invocation) — the mark tasks then simply do nothing.
+if not mlflow_run_id.strip():
+    dbutils.notebook.exit("no mlflow_run_id — skipping status update")
+
 # COMMAND ----------
 
 import mlflow

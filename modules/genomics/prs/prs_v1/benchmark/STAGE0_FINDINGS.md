@@ -1,6 +1,6 @@
 # Stage-0 findings — profiled scorer benchmark + worker-scaling curve
 
-Measured on `dev_exploration_sandbox` (single-user), node `c3d-highmem-8-lssd` (8 cores/64 GB),
+Measured on a single-user classic cluster, node `c3d-highmem-8-lssd` (8 cores/64 GB),
 DBR 15.4, classic job clusters. Data: 1000G `pca_dosage` exploded to the long store, capped at
 **30,000 loci × 3,202 samples ≈ 96M dosage rows**, 5 synthetic PGS (~60% density ≈ 30k weights each).
 Profiling via the driver Spark REST API (completed-stage diff per phase). Total suite cost ≈ **$0.30**
@@ -57,7 +57,7 @@ so more nodes just add distribution/coordination overhead with no parallelism to
    already batch (add_batch_x50 used the identical code path); the lever is the trigger, so
    `prs_scoring.job.yml` now has a file-arrival trigger on `prs_landing_zone` that batches arrivals
    (`min_time_between_triggers_seconds`/`wait_after_last_change_seconds`) — PAUSED until coordinated
-   with the BYB-2576 CF (which it should replace, not run alongside).
+   with any upstream file-delivery producer (which it should replace, not run alongside).
 2. **Right-size to single-node until data is genome-wide.** Workers only pay off once the *parallel* work
    (`task_s / cores`) exceeds the ~8s serial floor — i.e., when dosage is GBs, not MBs. At cohort/chr-scale
    the scorer is orchestration-bound; a single-node classic cluster wins. Re-run this curve at genome-wide

@@ -11,7 +11,7 @@ catalog allele ("0 copies of both alleles", a catalog-vs-reference disagreement)
 That correct value breaks the ``dose_effect = 2 − dose_canonical`` flip the offset
 trick assumes — a single canonical dose can't encode "0 of both" for both
 orientations. Validated: the canonical approach diverged from the naive
-``Σ dose(effect)·weight`` on Amy's real gVCF; the effect-oriented store matches it
+``Σ dose(effect)·weight`` on a real WGS gVCF; the effect-oriented store matches it
 exactly. The signed-weight trick is safe only on the panel side (clean pgen dose).
 
 Dedup is by ``(chrom,pos,effect,other)``: PGS that count the same allele at a

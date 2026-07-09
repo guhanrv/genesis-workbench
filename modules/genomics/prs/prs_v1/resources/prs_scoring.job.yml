@@ -84,12 +84,42 @@ resources:
             notebook_path: ../notebooks/01_score_prs.py
             source: WORKSPACE
 
+        # 6 — MLflow run status (framework convention; matches pca/gwas). No-ops when
+        #     mlflow_run_id is empty (a manual run not launched via batch-model invocation).
+        - task_key: mark_success
+          max_retries: 0
+          depends_on:
+            - task_key: score_prs
+          run_if: ALL_SUCCESS
+          job_cluster_key: prs_light_cluster
+          notebook_task:
+            notebook_path: ../notebooks/update_mlflow_status.py
+            source: WORKSPACE
+            base_parameters:
+              mlflow_run_id: "{{job.parameters.mlflow_run_id}}"
+              job_status: "prs_complete"
+
+        - task_key: mark_failure
+          max_retries: 0
+          depends_on:
+            - task_key: score_prs
+          run_if: AT_LEAST_ONE_FAILED
+          job_cluster_key: prs_light_cluster
+          notebook_task:
+            notebook_path: ../notebooks/update_mlflow_status.py
+            source: WORKSPACE
+            base_parameters:
+              mlflow_run_id: "{{job.parameters.mlflow_run_id}}"
+              job_status: "failed"
+
       # Job-level parameters propagate to every task's matching notebook widget.
       parameters:
         - name: catalog
           default: ${var.core_catalog_name}
         - name: schema
           default: ${var.core_schema_name}
+        - name: mlflow_run_id           # set by framework batch-model invocation; empty ⇒ status tasks no-op
+          default: ""
         # entry_mode is an OPERATOR-INTENT hint for logging (full | add_pgs | add_sample |
         # restate_pgs). Incrementality is AUTOMATIC — reconcile's anti-join and extract's
         # sample-skip decide the real work regardless of this value.
@@ -193,9 +223,10 @@ resources:
       # the window are drained in ONE run — the ~fixed per-run floor (reconcile + Spark job launches +
       # MERGE, ~9s) is paid once for the whole batch instead of per member.
       #
-      # PAUSED by default: enable (pause_status: UNPAUSED) only after coordinating with the BYB-2576
-      # Cloud Function — this trigger should REPLACE per-file job invocation, not run alongside it
-      # (otherwise you get both a per-file run AND the batched run). Tune the window to your SLA.
+      # PAUSED by default: enable (pause_status: UNPAUSED) only after coordinating with any upstream
+      # file-delivery producer (e.g. a Cloud Function copying gVCFs into the landing zone) — this trigger
+      # should REPLACE per-file job invocation, not run alongside it (otherwise you get both a per-file run
+      # AND the batched run). Tune the window to your SLA.
       trigger:
         pause_status: PAUSED
         file_arrival:
