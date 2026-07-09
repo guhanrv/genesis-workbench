@@ -82,6 +82,8 @@ resources:
           default: "0.01"
         - name: pvalue_threshold
           default: "0.01"
+        - name: pca_scores_table         # pca_v1 pca_components table for ancestry-PC covariates ("" = unadjusted)
+          default: ""
         - name: mlflow_run_id
           default: ""
         - name: user_email

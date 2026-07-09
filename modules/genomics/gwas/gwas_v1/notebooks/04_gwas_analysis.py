@@ -20,6 +20,7 @@ dbutils.widgets.text("phenotype_column", "phenotype", "Phenotype column")
 dbutils.widgets.text("contigs", "6", "Contigs to analyze (comma-separated)")
 dbutils.widgets.text("hwe_cutoff", "0.01", "HWE p-value cutoff")
 dbutils.widgets.text("pvalue_threshold", "0.01", "GWAS p-value threshold for Firth correction")
+dbutils.widgets.text("pca_scores_table", "", "Ancestry-PC covariates: pca_components table from pca_v1 (empty = UNADJUSTED)")
 dbutils.widgets.text("mlflow_run_id", "", "MLflow Run ID")
 dbutils.widgets.text("user_email", "a@b.com", "User Email")
 
@@ -30,6 +31,7 @@ mlflow_run_id = dbutils.widgets.get("mlflow_run_id")
 contigs = dbutils.widgets.get("contigs")
 hwe_cutoff = float(dbutils.widgets.get("hwe_cutoff"))
 pvalue_threshold = float(dbutils.widgets.get("pvalue_threshold"))
+pca_scores_table = dbutils.widgets.get("pca_scores_table").strip()
 
 # COMMAND ----------
 
@@ -54,6 +56,7 @@ mlflow_run_id = dbutils.widgets.get("mlflow_run_id")
 contigs = dbutils.widgets.get("contigs")
 hwe_cutoff = float(dbutils.widgets.get("hwe_cutoff"))
 pvalue_threshold = float(dbutils.widgets.get("pvalue_threshold"))
+pca_scores_table = dbutils.widgets.get("pca_scores_table").strip()   # re-read (restartPython wiped state)
 
 # COMMAND ----------
 
@@ -61,6 +64,7 @@ import glow
 spark = glow.register(spark)
 spark.conf.set("spark.sql.codegen.wholeStage", False)
 
+import pandas as pd
 import pyspark.sql.functions as F
 
 # COMMAND ----------
@@ -192,9 +196,31 @@ spark.conf.set("spark.sql.execution.arrow.maxRecordsPerBatch", 100)
 
 contig_list = [c.strip() for c in contigs.split(",")]
 
+# --- ancestry-PC covariates (from pca_v1's in-cohort PCA) — the fix for confounding by structure ---
+# Empty pca_scores_table → UNADJUSTED (legacy behavior). Otherwise standardize raw → z against the
+# cohort's own PCs: glow aligns covariate_df to phenotype_pdf by index (sampleId), so it must cover
+# every phenotyped sample. Run pca_v1's pca_compute on THIS cohort's VCF first (its pca_components
+# table is the covariates).
+covariate_pdf = pd.DataFrame(index=phenotype_pdf.index)   # empty (no covariates) = unadjusted
+if pca_scores_table:
+    tbl = pca_scores_table if "." in pca_scores_table else f"{catalog}.{schema}.{pca_scores_table}"
+    cov = spark.table(tbl).toPandas().set_index("sample_id")
+    cov.index = cov.index.astype(str)
+    cov = cov[[c for c in cov.columns if c.startswith("PC")]]
+    cov = cov.reindex(phenotype_pdf.index)                # align to phenotyped samples, same order
+    missing = int(cov.isna().any(axis=1).sum())
+    if missing:
+        raise ValueError(f"{missing}/{len(cov)} phenotyped samples have no PCs in {tbl} — run "
+                         f"pca_v1/pca_compute on this cohort's VCF so every sample has covariates.")
+    covariate_pdf = cov
+    print(f"GWAS adjusted for {cov.shape[1]} ancestry PCs from {tbl}")
+else:
+    print("GWAS UNADJUSTED (no pca_scores_table) — pass pca_v1's pca_components for structure control")
+
 results = glow.gwas.logistic_regression(
     hwe_filtered_df,
     phenotype_pdf,
+    covariate_pdf,
     values_column='values',
     correction='approx-firth',
     pvalue_threshold=pvalue_threshold,
