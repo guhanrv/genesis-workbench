@@ -18,6 +18,10 @@
 
 # COMMAND ----------
 
+# MAGIC %pip install pyyaml
+
+# COMMAND ----------
+
 dbutils.widgets.text("catalog", "genesis_workbench", "Catalog")
 dbutils.widgets.text("schema", "genesis_schema", "Schema")
 dbutils.widgets.text("catalog_config_path", "", "Path to prs.yaml (curation source of truth)")

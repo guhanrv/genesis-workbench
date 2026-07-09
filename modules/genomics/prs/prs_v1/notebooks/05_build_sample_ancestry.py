@@ -36,7 +36,7 @@ schema = dbutils.widgets.get("schema")
 
 # COMMAND ----------
 
-# MAGIC %pip install pysam
+# MAGIC %pip install pysam scikit-learn scipy
 # MAGIC dbutils.library.restartPython()
 
 # COMMAND ----------
