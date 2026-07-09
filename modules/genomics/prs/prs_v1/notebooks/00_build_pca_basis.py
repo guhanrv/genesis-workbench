@@ -16,9 +16,9 @@
 # MAGIC   2. **LD prune** — per chromosome (`applyInPandas`, distributed): sliding `window_bp` window; drop a
 # MAGIC      variant whose r² ≥ `r2` with an already-kept variant (greedy MIS, à la Hail `ld_prune` / plink2
 # MAGIC      `--indep-pairwise`), keeping the earlier/higher-MAF one.
-# MAGIC   3. **Fit** — standardize each pruned variant (per-variant mean/std, missing→0); accumulate the
-# MAGIC      panel Gram `G = Σ_v zᵥ zᵥᵀ` (= XᵀX, samples×samples) distributed via `treeReduce`; eigendecompose
-# MAGIC      on the driver (3,330² is trivial) → `V`, `s`. Derive per-variant loadings `U = z·V/s` distributed.
+# MAGIC   3. **Fit** — the pruned panel is small (n_var × n_panel), so collect it to the driver and fit in
+# MAGIC      numpy: standardize (per-variant mean/std, missing→0), Gram `XᵀX` (samples×samples) as one BLAS
+# MAGIC      gemm → `eigh` → `V`, `s`, and loadings `U = X·(V/s)`. Verbatim `lib/prs_ancestry.fit_panel_basis`.
 # MAGIC      This reproduces `lib/prs_ancestry.fit_panel_basis` — so `project_member`/`classify` are unchanged.
 # MAGIC   4. **Persist** `pca_basis.npz` (loci, U, s, V, pcs_ref, mean, std, superpops) to the Volume.
 
@@ -175,9 +175,15 @@ def _prune_chrom(pdf):
     from bisect import bisect_left
     pdf = pdf.sort_values("pos")
     pos = pdf["pos"].to_numpy()
-    D = _np.asarray(pdf["dose"].tolist(), dtype=_np.float32)     # (m, n_panel)
-    mean = _np.nanmean(D, 1, keepdims=True); sd = _np.nanstd(D, 1, keepdims=True); sd[sd == 0] = 1
-    Z = _np.nan_to_num((D - mean) / sd).astype(_np.float32); inv = 1.0 / D.shape[1]
+    # each group is one CHUNK_BP position slice of a chromosome (not a whole chromosome), so D is
+    # bounded (~0.5 GB) regardless of chromosome size. stack without .tolist()'s Python list-of-lists
+    # transient and standardize in-place in float32 to keep peak memory ~2×D.
+    D = _np.stack(pdf["dose"].to_numpy()).astype(_np.float32, copy=False)   # (m, n_panel)
+    mean = _np.nanmean(D, 1, keepdims=True).astype(_np.float32)
+    sd = _np.nanstd(D, 1, keepdims=True).astype(_np.float32); sd[sd == 0] = 1
+    inv = 1.0 / D.shape[1]
+    Z = D - mean; Z /= sd; _np.nan_to_num(Z, copy=False)
+    del D, mean, sd                                             # free dose matrix before the r² loop
     kpos, kidx = [], []
     keep = _np.zeros(len(pdf), dtype=bool)
     for i in range(len(pdf)):
@@ -190,70 +196,59 @@ def _prune_chrom(pdf):
     out = pdf.loc[keep, ["vidx", "chrom", "pos", "ref", "alt"]]
     return out
 
-kept = qc.groupBy("chrom").applyInPandas(_prune_chrom, schema=PRUNE_SCHEMA)
+# Partition each chromosome into CHUNK_BP position slices so no single prune task materializes a
+# whole chromosome's dose matrix (chr2 ≈ 461k×3330 ≈ 6 GB → OOM). This is Hail ld_prune's stage-1
+# "local prune per partition": greedy windowed prune within each slice. The only approximation vs a
+# whole-chromosome prune is at slice seams (variants in the first WINDOW_BP of a slice don't see kept
+# variants just across the boundary → a few extra retained loci), which is immaterial for a PCA basis.
+CHUNK_BP = 25_000_000
+qc_chunked = qc.withColumn("chunk", (F.col("pos") / F.lit(CHUNK_BP)).cast("long"))
+kept = qc_chunked.groupBy("chrom", "chunk").applyInPandas(_prune_chrom, schema=PRUNE_SCHEMA)
 kept = kept.orderBy(F.col("chrom").cast("int"), "pos")            # stable variant order
 kept_pd = kept.toPandas()
 n_var = len(kept_pd)
 order_by_vidx = {int(v): i for i, v in enumerate(kept_pd["vidx"].tolist())}
-ORDER_B = spark.sparkContext.broadcast(order_by_vidx)
 print(f"pruned loci: {n_var}")
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ### 4. Fit — distributed Gram (XᵀX) → driver eigendecomposition → distributed loadings
+# MAGIC ### 4. Fit on the driver — collect the pruned panel (small) → BLAS XᵀX → eigh → loadings
 
 # COMMAND ----------
 
-# kept dose only (join pruned vidx back to the QC dose)
-kept_dose = qc.join(F.broadcast(kept.select("vidx")), "vidx").select("vidx", "dose")
+# The pruned panel is small (n_var × n_panel ≈ 2 GB), so collect it once and fit on the driver:
+# XᵀX is a single BLAS gemm — not a distributed treeReduce of n_var np.outer calls — and we avoid
+# re-scanning the multi-GB QC store for a separate loadings pass. The standardize/eigh/loadings below
+# are verbatim lib/prs_ancestry.fit_panel_basis (FRAPOSA), so the basis is identical to the validated
+# science. (Requires spark.driver.maxResultSize ≥ ~4g for the ~2 GB collect.)
+kept_rows = qc.join(F.broadcast(kept.select("vidx")), "vidx").select("vidx", "dose").collect()
+vidx_arr = np.fromiter((r["vidx"] for r in kept_rows), np.int64, len(kept_rows))
+X = np.stack([np.asarray(r["dose"], dtype=np.float32) for r in kept_rows])   # (n_var, n_panel), NaN=missing
+X = X[np.argsort([order_by_vidx[int(v)] for v in vidx_arr])]                 # stable (chrom, pos) order
+assert X.shape[0] == n_var, f"collected {X.shape[0]} != pruned {n_var}"
+del kept_rows, vidx_arr
 
-def _std(d):
-    z = np.asarray(d, dtype=np.float64)
-    m = np.nanmean(z); s = np.nanstd(z)
-    if not (s > 0):
-        s = 1.0
-    z = (z - m) / s
-    z[np.isnan(z)] = 0.0
-    return z, float(m), float(s)
+# FRAPOSA standardize: per-variant mean/std (ddof=0), cast to float32, missing → 0 (verbatim fit_panel_basis).
+is_miss = np.isnan(X)
+mean = np.zeros(n_var, np.float64); std = np.zeros(n_var, np.float64)
+for i in range(n_var):
+    row = X[i, :][~is_miss[i, :]]
+    if row.size:
+        mean[i] = float(np.mean(row)); std[i] = float(np.std(row))
+std[std == 0] = 1.0
+X -= mean.astype(np.float32).reshape(-1, 1)
+X /= std.astype(np.float32).reshape(-1, 1)
+X[is_miss] = 0.0
+mean = mean.reshape(-1, 1); std = std.reshape(-1, 1)
 
-# 4a. Gram G = Σ_v zᵥ zᵥᵀ (n_panel × n_panel) via treeReduce over kept dose rows.
-def _part_gram(rows):
-    G = np.zeros((n_panel, n_panel), dtype=np.float64)
-    for r in rows:
-        z, _, _ = _std(r["dose"]); G += np.outer(z, z)
-    yield G
-
-G = kept_dose.select("dose").rdd.mapPartitions(_part_gram).treeReduce(lambda a, b: a + b, depth=3)
-ssq, V = np.linalg.eigh(G)                       # ascending
-s_all = np.sqrt(np.abs(ssq))[::-1]               # descending
-V_all = V.T[::-1].T
+XTX = (X.T @ X).astype(np.float64)                               # (n_panel × n_panel), single BLAS gemm
+ssq, V = np.linalg.eigh(XTX)
+s_all = np.sqrt(np.abs(ssq))[::-1]; V_all = V.T[::-1].T          # descending
 s_on = s_all[:dim_online]; V_on = V_all[:, :dim_online]          # (n_panel × dim_online)
-pcs_ref = (V_all[:, :dim_ref] * s_all[:dim_ref])                 # (n_panel × dim_ref)
-VS_B = spark.sparkContext.broadcast(V_on / s_on)                 # (n_panel × dim_online) for loadings
-print(f"eigendecomposition: top s = {np.round(s_on[:dim_ref], 1)}")
-
-# 4b. per-variant mean/std + loadings U = z·(V_on/s_on), tagged with stable order.
-LOAD_SCHEMA = StructType([
-    StructField("ord", IntegerType()), StructField("mean", FloatType()), StructField("std", FloatType()),
-    StructField("u", ArrayType(FloatType()))])
-
-def _loadings(itr):
-    vs = VS_B.value; ordr = ORDER_B.value
-    for pdf in itr:
-        rows = []
-        for _, r in pdf.iterrows():
-            z, m, sd = _std(r["dose"])
-            u = z @ vs                                # (dim_online,)
-            rows.append((int(ordr[int(r["vidx"])]), float(m), float(sd), [float(x) for x in u]))
-        if rows:
-            yield pd.DataFrame(rows, columns=["ord", "mean", "std", "u"])
-
-load = kept_dose.mapInPandas(_loadings, schema=LOAD_SCHEMA).toPandas().sort_values("ord")
-assert len(load) == n_var, f"loadings {len(load)} != loci {n_var}"
-U_on = np.asarray(load["u"].tolist(), dtype=np.float64)          # (n_var × dim_online)
-mean = load["mean"].to_numpy(np.float64).reshape(-1, 1)
-std = load["std"].to_numpy(np.float64).reshape(-1, 1)
+pcs_ref = V_all[:, :dim_ref] * s_all[:dim_ref]                   # (n_panel × dim_ref)
+U_on = (X @ (V_on / s_on)).astype(np.float64)                   # (n_var × dim_online)
+print(f"eigendecomposition (driver): top s = {np.round(s_on[:dim_ref], 1)}")
 
 # COMMAND ----------
 
