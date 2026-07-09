@@ -85,9 +85,20 @@ CREATE TABLE IF NOT EXISTS prs_scores (
 PARTITIONED BY (pgs_id)
 """)
 
+# 6. Ancestry — per-sample most-similar-population from the frozen PCA basis (00_build_pca_basis +
+#    05_build_sample_ancestry). The scorer left-joins this on sample_id to pick the panel superpop row
+#    for z_msp/percentile_msp; declared here so it always exists (empty ⇒ scorer degrades to null z).
+spark.sql("""
+CREATE TABLE IF NOT EXISTS sample_ancestry (
+    sample_id STRING, most_similar_pop STRING, mahalanobis_p_all DOUBLE,
+    n_loci_covered BIGINT, n_loci_basis BIGINT, panel_version STRING,
+    rf_probs STRING, computed_at TIMESTAMP
+) USING DELTA
+""")
+
 # COMMAND ----------
 
-for t in ["pgs_registry", "pgs_weights", "pgs_panel_ref", "dosage", "prs_scores"]:
+for t in ["pgs_registry", "pgs_weights", "pgs_panel_ref", "dosage", "prs_scores", "sample_ancestry"]:
     n = spark.table(t).count()
     print(f"  {catalog}.{schema}.{t}: exists, {n} rows")
 print("PRS stores ready.")

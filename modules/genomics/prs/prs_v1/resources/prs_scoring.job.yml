@@ -60,11 +60,25 @@ resources:
             notebook_path: ../notebooks/02_reconcile.py
             source: WORKSPACE
 
+        # 4b — per-sample ancestry: OADP-project members onto the frozen PCA basis → RF MSP →
+        #      sample_ancestry. Extraction (basis loci) is distributed like extract_dosage; reuses
+        #      the (warm) extract cluster right after it — so ancestry runs in PARALLEL with reconcile
+        #      (light cluster), both finishing before score_prs. Incremental (skips classified members).
+        - task_key: build_sample_ancestry
+          max_retries: 0
+          depends_on:
+            - task_key: extract_dosage
+          job_cluster_key: prs_extract_cluster
+          notebook_task:
+            notebook_path: ../notebooks/05_build_sample_ancestry.py
+            source: WORKSPACE
+
         # 5 — SQL join-aggregate over the plan + panel-ref normalization + MERGE prs_scores.
         - task_key: score_prs
           max_retries: 0
           depends_on:
             - task_key: reconcile
+            - task_key: build_sample_ancestry
           job_cluster_key: prs_score_cluster
           notebook_task:
             notebook_path: ../notebooks/01_score_prs.py
@@ -98,6 +112,9 @@ resources:
           default: ${var.prs_fasta_ref_cache}
         - name: reextract                # true to re-extract existing samples (after add-PGS)
           default: "false"
+        # ancestry (build_sample_ancestry) — the frozen PCA basis it projects members onto
+        - name: basis_path
+          default: ${var.prs_pca_basis}
         # scope (register + extract + reconcile all honor pgs_ids)
         - name: pgs_ids
           default: ""

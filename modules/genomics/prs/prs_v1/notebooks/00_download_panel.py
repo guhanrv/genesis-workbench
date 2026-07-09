@@ -26,10 +26,14 @@ import zstandard, tarfile
 dest = dbutils.widgets.get("dest_volume_dir").rstrip("/")
 url = dbutils.widgets.get("url")
 assert dest, "set dest_volume_dir"
-# Extract pgen (pgenlib genotypes) + psam (metadata) + pvar.zst (variant table → parquet index-map,
-# derived server-side so nothing depends on a local file).
-WANT = ("GRCh38_HGDP+1kGP_ALL.pgen", "GRCh38_HGDP+1kGP_ALL.psam", "GRCh38_HGDP+1kGP_ALL.pvar.zst")
-TO_VOLUME = ("GRCh38_HGDP+1kGP_ALL.pgen", "GRCh38_HGDP+1kGP_ALL.psam")   # + the parquet we build below
+# Extract pgen (pgenlib genotypes) + psam (metadata incl. SuperPop labels) + pvar.zst (variant table →
+# parquet index-map, derived server-side) + king.cutoff (related-sample exclude list). The latter two also
+# go to the Volume so the PCA-ancestry basis (00_build_pca_basis: plink2 QC/prune vs pvar.zst, --remove
+# king.cutoff) is fully regenerable server-side with nothing depending on a local file.
+WANT = ("GRCh38_HGDP+1kGP_ALL.pgen", "GRCh38_HGDP+1kGP_ALL.psam", "GRCh38_HGDP+1kGP_ALL.pvar.zst",
+        "GRCh38_HGDP+1kGP.king.cutoff.out.id")
+TO_VOLUME = ("GRCh38_HGDP+1kGP_ALL.pgen", "GRCh38_HGDP+1kGP_ALL.psam",
+             "GRCh38_HGDP+1kGP_ALL.pvar.zst", "GRCh38_HGDP+1kGP.king.cutoff.out.id")   # + parquet built below
 local = "/local_disk0/panel"; os.makedirs(local, exist_ok=True)
 archive = "/local_disk0/pgsc_panel.tar.zst"
 

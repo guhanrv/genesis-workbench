@@ -56,3 +56,10 @@ variables:
       and BATCHES arrivals (one run drains all pending gVCFs — ~45x cheaper/member than per-member
       runs, per Stage-0). Also the default vcf_dir for extraction.
     default: /Volumes/${var.core_catalog_name}/${var.core_schema_name}/prs_data/incoming
+
+  prs_pca_basis:
+    description: >-
+      Volume path to the frozen FRAPOSA PCA basis (pca_basis.npz) — the one-time HGDP+1kGP reference
+      that 05_build_sample_ancestry projects members onto for MSP. Built by 00_build_pca_basis (or
+      staged from the validated local build). Ancestry analogue of the panel pgen / pgs_panel_afreq.
+    default: /Volumes/${var.core_catalog_name}/${var.core_schema_name}/prs_reference/panel/pca_basis.npz
