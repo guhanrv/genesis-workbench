@@ -28,7 +28,7 @@ resources:
             notebook_path: ../notebooks/00_download_panel.py
             source: WORKSPACE
 
-        # 2 — QC + LD-prune the panel (plink2) → FRAPOSA fit → pca_basis.npz (the ancestry basis).
+        # 2 — Spark-native QC + windowed LD-prune + PCA → pca_basis.npz (the ancestry basis).
         - task_key: build_pca_basis
           max_retries: 0
           depends_on:
