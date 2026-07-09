@@ -46,13 +46,13 @@ variables:
 
   pca_reference_dir:
     description: >-
-      Volume dir where the HGDP+1kGP reference panel is staged (00_download_panel) and the frozen
+      Volume dir where the HGDP+1kGP reference panel is staged (ref_00_download_panel) and the frozen
       basis is built. pca_v1 owns this ancestry-reference; prs reads the panel + basis from here.
     default: /Volumes/${var.core_catalog_name}/${var.core_schema_name}/pca_reference/panel
 
   pca_basis:
     description: >-
       Volume path to the frozen FRAPOSA PCA basis (pca_basis.npz) produced by
-      03_build_reference_basis. The one projectable model prs projects members onto for ancestry
+      ref_01_build_basis. The one projectable model prs projects members onto for ancestry
       classification (and the reference PCs for the RF). Ancestry analogue of a saved ML model.
     default: /Volumes/${var.core_catalog_name}/${var.core_schema_name}/pca_reference/pca_basis.npz

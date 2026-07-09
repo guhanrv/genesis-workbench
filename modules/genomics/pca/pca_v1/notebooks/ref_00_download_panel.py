@@ -28,7 +28,7 @@ url = dbutils.widgets.get("url")
 assert dest, "set dest_volume_dir"
 # Extract pgen (pgenlib genotypes) + psam (metadata incl. SuperPop labels) + pvar.zst (variant table) +
 # king.cutoff (related-sample exclude list). king.cutoff is staged to the Volume so the Spark-native
-# PCA-ancestry basis (00_build_pca_basis excludes related samples via king.cutoff) is regenerable
+# PCA-ancestry basis (ref_01_build_basis excludes related samples via king.cutoff) is regenerable
 # server-side with nothing depending on a local file. pvar.zst is extracted only to DERIVE pvar.parquet
 # (step 3) — the parquet is what the builders consume, so pvar.zst itself is NOT staged to the Volume.
 WANT = ("GRCh38_HGDP+1kGP_ALL.pgen", "GRCh38_HGDP+1kGP_ALL.psam", "GRCh38_HGDP+1kGP_ALL.pvar.zst",

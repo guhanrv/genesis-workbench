@@ -23,7 +23,7 @@ resources:
           max_retries: 0
           job_cluster_key: pca_ref_cluster
           notebook_task:
-            notebook_path: ../notebooks/00_download_panel.py
+            notebook_path: ../notebooks/ref_00_download_panel.py
             source: WORKSPACE
 
         # 2 — Spark-native QC + windowed LD-prune + PCA → pca_basis.npz (the projectable basis).
@@ -33,7 +33,7 @@ resources:
             - task_key: download_panel
           job_cluster_key: pca_ref_cluster
           notebook_task:
-            notebook_path: ../notebooks/03_build_reference_basis.py
+            notebook_path: ../notebooks/ref_01_build_basis.py
             source: WORKSPACE
 
       parameters:
@@ -41,12 +41,12 @@ resources:
           default: ${var.core_catalog_name}
         - name: schema
           default: ${var.core_schema_name}
-        # panel staging (00_download_panel) + where the builder reads it from
+        # panel staging (ref_00_download_panel) + where the builder reads it from
         - name: dest_volume_dir
           default: ${var.pca_reference_dir}
         - name: panel_dir
           default: ${var.pca_reference_dir}
-        # PCA basis (03_build_reference_basis) — Spark-native, no plink2
+        # PCA basis (ref_01_build_basis) — Spark-native, no plink2
         - name: out_path
           default: ${var.pca_basis}
         - name: panel_psam

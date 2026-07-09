@@ -67,6 +67,6 @@ variables:
   prs_pca_basis:
     description: >-
       Volume path to the frozen FRAPOSA PCA basis (pca_basis.npz) that 05_build_sample_ancestry
-      projects members onto for MSP. BUILT BY THE PCA MODULE (pca_v1/03_build_reference_basis);
+      projects members onto for MSP. BUILT BY THE PCA MODULE (pca_v1/ref_01_build_basis);
       prs consumes it as a read-only artifact. Ancestry analogue of a saved model.
     default: /Volumes/${var.core_catalog_name}/${var.core_schema_name}/pca_reference/pca_basis.npz

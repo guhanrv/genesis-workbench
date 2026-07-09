@@ -4,7 +4,7 @@
 # MAGIC
 # MAGIC The **in-cohort** adapter: reads the Glow-ingested dosage Delta from `00_ingest_vcf`, QC's to
 # MAGIC common biallelic SNPs, and hands a per-variant dose table to the shared **`lib/pca_fit`** — the
-# MAGIC exact same LD-prune + FRAPOSA fit the **reference** adapter (`03_build_reference_basis`) uses.
+# MAGIC exact same LD-prune + FRAPOSA fit the **reference** adapter (`ref_01_build_basis`) uses.
 # MAGIC One fit, one output contract: it emits a projectable model npz (loadings/mean/std/loci/scores)
 # MAGIC plus a per-sample scores table — the PCs a GWAS adjusts for (genesis's GWAS runs unadjusted).
 # MAGIC
@@ -44,13 +44,13 @@ import numpy as np
 import pyspark.sql.functions as F
 
 sys.path.append(os.path.abspath(os.path.join(os.getcwd(), "..", "lib")))
-import pca_fit                                   # the shared prune + FRAPOSA fit (same as 03)
+import pca_fit                                   # the shared prune + FRAPOSA fit (same as ref_01_build_basis)
 
 # COMMAND ----------
 
 # MAGIC %md
 # MAGIC ### 1. Dosage (from ingest) → QC'd per-variant dose table (the shared-fit hand-off)
-# MAGIC Same contract the reference adapter (`03_build_reference_basis`) produces: one row per variant
+# MAGIC Same contract the reference adapter (`ref_01_build_basis`) produces: one row per variant
 # MAGIC with a float dose array over samples (NaN = missing). Keep biallelic common SNPs (MAF ≥ cutoff;
 # MAGIC biallelic already enforced at ingest), then hand off to `lib/pca_fit` — identical LD-prune +
 # MAGIC FRAPOSA fit as the reference basis, so this in-cohort path and the reference path are one engine.

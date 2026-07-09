@@ -11,7 +11,7 @@ superpop labels, provenance}. Optionally also materializes the per-sample scores
 
 Both entry points call this with the SAME contract; they differ only in how they
 produce the QC'd dose table (the source-specific adapter):
-  - ``03_build_reference_basis`` — pgenlib read of the frozen HGDP+1kGP panel (labeled),
+  - ``ref_01_build_basis`` — pgenlib read of the frozen HGDP+1kGP panel (labeled),
   - ``01_compute_pca``          — Glow-ingested cohort dosage (in-cohort, unlabeled).
 
 The fit is verbatim the FRAPOSA ``lib/prs_ancestry.fit_panel_basis`` used by prs to

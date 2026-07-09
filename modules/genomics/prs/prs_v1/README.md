@@ -54,7 +54,7 @@ setup_stores → register → extract_dosage → reconcile ───────
 
 ## Companion jobs
 
-- **`prs_reference_setup`** — one-time reference builders (run on demand): `00_download_panel` → `00_build_pca_basis` (`pca_basis.npz`) + `04_build_panel_afreq` (`pgs_panel_afreq`). `00_build_pca_basis` is **Spark-native (no plink2)**: distributed QC + Hail-style windowed-r² LD-prune + distributed sample-covariance eigendecomposition (the `pca_v1/01_compute_pca` / Databricks `cspray` pattern), reproducing `lib/prs_ancestry.fit_panel_basis`. `00_download_pgs_scorefile` runs in `prs_initial_setup_job`.
+- **`prs_reference_setup`** — one-time scoring-reference builder (run on demand): `04_build_panel_afreq` → `pgs_panel_afreq` (panel allele frequencies for mean-imputing missing PGS variants). It reads the HGDP+1kGP panel from the **pca** module's `pca_reference` volume (pca owns the ancestry reference). The frozen PCA basis itself (`pca_basis.npz`) is built by **`pca_v1`** (`ref_01_build_basis`, Spark-native: distributed QC + Hail-style windowed-r² LD-prune + FRAPOSA eigendecomposition) and consumed here as a read-only artifact — see `pca_v1`. Run `pca_reference_setup` before this. `00_download_pgs_scorefile` runs in `prs_initial_setup_job`.
 - **`prs_maintenance`** — scheduled (paused) `03_maintain_stores`: OPTIMIZE + VACUUM + ANALYZE so MERGE versioning doesn't balloon.
 
 ## Key parameters (`prs_scoring`)
