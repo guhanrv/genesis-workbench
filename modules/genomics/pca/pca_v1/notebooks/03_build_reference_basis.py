@@ -66,7 +66,6 @@ R2 = float(dbutils.widgets.get("r2")); WINDOW_BP = int(dbutils.widgets.get("wind
 BLOCK = int(dbutils.widgets.get("block_size")); panel_version = dbutils.widgets.get("panel_version")
 assert panel_pgen and pvar_parquet and panel_psam and king_cutoff and out_path, "paths are required"
 spark.sql(f"USE CATALOG {catalog}"); spark.sql(f"USE SCHEMA {schema}")
-dim_stu = dim_ref * 2; dim_online = dim_stu * 2
 
 # COMMAND ----------
 
@@ -174,111 +173,21 @@ print(f"QC-passing variants: {qc.count()}")
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ### 3. Distributed LD prune (per chromosome; Hail-style windowed greedy r²)
+# MAGIC ### 3. Prune + fit → the projectable model (shared `lib/pca_fit`)
+# MAGIC The QC'd per-variant dose table is the source-agnostic hand-off: from here the LD-prune,
+# MAGIC FRAPOSA standardize/eigh, and npz persist are the SAME code the in-cohort path (`01_compute_pca`)
+# MAGIC uses — `lib/pca_fit.fit_pca_model`. This notebook is now just the reference-cohort adapter.
 
 # COMMAND ----------
 
-PRUNE_SCHEMA = StructType([
-    StructField("vidx", LongType()), StructField("chrom", StringType()),
-    StructField("pos", LongType()), StructField("ref", StringType()), StructField("alt", StringType())])
+import sys
+sys.path.append(os.path.abspath(os.path.join(os.getcwd(), "..", "lib")))
+import pca_fit
 
-def _prune_chrom(pdf):
-    import numpy as _np
-    from bisect import bisect_left
-    pdf = pdf.sort_values("pos")
-    pos = pdf["pos"].to_numpy()
-    # each group is one CHUNK_BP position slice of a chromosome (not a whole chromosome), so D is
-    # bounded (~0.5 GB) regardless of chromosome size. stack without .tolist()'s Python list-of-lists
-    # transient and standardize in-place in float32 to keep peak memory ~2×D.
-    D = _np.stack(pdf["dose"].to_numpy()).astype(_np.float32, copy=False)   # (m, n_panel)
-    mean = _np.nanmean(D, 1, keepdims=True).astype(_np.float32)
-    sd = _np.nanstd(D, 1, keepdims=True).astype(_np.float32); sd[sd == 0] = 1
-    inv = 1.0 / D.shape[1]
-    Z = D - mean; Z /= sd; _np.nan_to_num(Z, copy=False)
-    del D, mean, sd                                             # free dose matrix before the r² loop
-    kpos, kidx = [], []
-    keep = _np.zeros(len(pdf), dtype=bool)
-    for i in range(len(pdf)):
-        lo = bisect_left(kpos, pos[i] - WINDOW_BP)
-        if lo < len(kidx):
-            r2 = (Z[kidx[lo:]].astype(_np.float64) @ Z[i].astype(_np.float64) * inv) ** 2
-            if (r2 >= R2).any():
-                continue
-        kpos.append(int(pos[i])); kidx.append(i); keep[i] = True
-    out = pdf.loc[keep, ["vidx", "chrom", "pos", "ref", "alt"]]
-    return out
-
-# Partition each chromosome into CHUNK_BP position slices so no single prune task materializes a
-# whole chromosome's dose matrix (chr2 ≈ 461k×3330 ≈ 6 GB → OOM). This is Hail ld_prune's stage-1
-# "local prune per partition": greedy windowed prune within each slice. The only approximation vs a
-# whole-chromosome prune is at slice seams (variants in the first WINDOW_BP of a slice don't see kept
-# variants just across the boundary → a few extra retained loci), which is immaterial for a PCA basis.
-CHUNK_BP = 25_000_000
-qc_chunked = qc.withColumn("chunk", (F.col("pos") / F.lit(CHUNK_BP)).cast("long"))
-kept = qc_chunked.groupBy("chrom", "chunk").applyInPandas(_prune_chrom, schema=PRUNE_SCHEMA)
-kept = kept.orderBy(F.col("chrom").cast("int"), "pos")            # stable variant order
-kept_pd = kept.toPandas()
-n_var = len(kept_pd)
-order_by_vidx = {int(v): i for i, v in enumerate(kept_pd["vidx"].tolist())}
-print(f"pruned loci: {n_var}")
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ### 4. Fit on the driver — collect the pruned panel (small) → BLAS XᵀX → eigh → loadings
-
-# COMMAND ----------
-
-# The pruned panel is small (n_var × n_panel ≈ 2 GB), so collect it once and fit on the driver:
-# XᵀX is a single BLAS gemm — not a distributed treeReduce of n_var np.outer calls — and we avoid
-# re-scanning the multi-GB QC store for a separate loadings pass. The standardize/eigh/loadings below
-# are verbatim lib/prs_ancestry.fit_panel_basis (FRAPOSA), so the basis is identical to the validated
-# science. (Requires spark.driver.maxResultSize ≥ ~4g for the ~2 GB collect.)
-kept_rows = qc.join(F.broadcast(kept.select("vidx")), "vidx").select("vidx", "dose").collect()
-vidx_arr = np.fromiter((r["vidx"] for r in kept_rows), np.int64, len(kept_rows))
-X = np.stack([np.asarray(r["dose"], dtype=np.float32) for r in kept_rows])   # (n_var, n_panel), NaN=missing
-X = X[np.argsort([order_by_vidx[int(v)] for v in vidx_arr])]                 # stable (chrom, pos) order
-assert X.shape[0] == n_var, f"collected {X.shape[0]} != pruned {n_var}"
-del kept_rows, vidx_arr
-
-# FRAPOSA standardize: per-variant mean/std (ddof=0), cast to float32, missing → 0 (verbatim fit_panel_basis).
-is_miss = np.isnan(X)
-mean = np.zeros(n_var, np.float64); std = np.zeros(n_var, np.float64)
-for i in range(n_var):
-    row = X[i, :][~is_miss[i, :]]
-    if row.size:
-        mean[i] = float(np.mean(row)); std[i] = float(np.std(row))
-std[std == 0] = 1.0
-X -= mean.astype(np.float32).reshape(-1, 1)
-X /= std.astype(np.float32).reshape(-1, 1)
-X[is_miss] = 0.0
-mean = mean.reshape(-1, 1); std = std.reshape(-1, 1)
-
-XTX = (X.T @ X).astype(np.float64)                               # (n_panel × n_panel), single BLAS gemm
-ssq, V = np.linalg.eigh(XTX)
-s_all = np.sqrt(np.abs(ssq))[::-1]; V_all = V.T[::-1].T          # descending
-s_on = s_all[:dim_online]; V_on = V_all[:, :dim_online]          # (n_panel × dim_online)
-pcs_ref = V_all[:, :dim_ref] * s_all[:dim_ref]                   # (n_panel × dim_ref)
-U_on = (X @ (V_on / s_on)).astype(np.float64)                   # (n_var × dim_online)
-print(f"eigendecomposition (driver): top s = {np.round(s_on[:dim_ref], 1)}")
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ### 5. Persist pca_basis.npz (same shape as lib/prs_ancestry.fit_panel_basis output)
-
-# COMMAND ----------
-
-local_npz = "/local_disk0/pca_basis.npz"
-np.savez(local_npz,
-         loci_chrom=kept_pd["chrom"].astype(str).to_numpy(),
-         loci_pos=kept_pd["pos"].to_numpy(np.int64),
-         loci_ref=kept_pd["ref"].astype(str).to_numpy(),
-         loci_alt=kept_pd["alt"].astype(str).to_numpy(),
-         U_on=U_on, s_on=s_on, V_on=V_on, pcs_ref=pcs_ref, mean=mean, std=std,
-         dim_ref=dim_ref, dim_stu=dim_stu,
-         panel_iids=np.array(unrel_iids), superpops=superpops, panel_version=np.array(panel_version))
-dbutils.fs.cp("file:" + local_npz, out_path)
+pca_fit.fit_pca_model(
+    spark, qc,
+    sample_ids=unrel_iids, superpops=superpops,
+    dim_ref=dim_ref, r2=R2, window_bp=WINDOW_BP,
+    panel_version=panel_version, out_path=out_path,
+)
 spark.sql("DROP TABLE IF EXISTS _pca_qc_dose")
-print(f"wrote basis → {out_path} | n_loci={n_var} n_panel={n_panel} "
-      f"dim_online={dim_online} panel_version={panel_version}")

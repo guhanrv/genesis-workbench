@@ -82,6 +82,12 @@ resources:
           default: "0.05"
         - name: max_variants
           default: "0"
+        - name: r2
+          default: "0.05"
+        - name: window_bp
+          default: "1000000"
+        - name: model_dir            # where 01_compute_pca writes the projectable model npz
+          default: /Volumes/${var.core_catalog_name}/${var.core_schema_name}/pca_results
         - name: mlflow_run_id
           default: ""
         - name: user_email
