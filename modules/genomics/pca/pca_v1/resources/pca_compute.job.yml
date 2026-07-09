@@ -88,6 +88,8 @@ resources:
           default: "1000000"
         - name: model_dir            # where 01_compute_pca writes the projectable model npz
           default: /Volumes/${var.core_catalog_name}/${var.core_schema_name}/pca_results
+        - name: backend              # driver (default) | distributed (large cohorts; classic cluster)
+          default: driver
         - name: mlflow_run_id
           default: ""
         - name: user_email

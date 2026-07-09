@@ -36,6 +36,11 @@ import pandas as pd
 import pyspark.sql.functions as F
 from pyspark.sql.types import StructType, StructField, StringType, LongType
 
+# Version of the pca_basis.npz contract (keys/shapes the model exposes). Bump on any breaking
+# change to the npz schema; downstream consumers (prs 05_build_sample_ancestry) assert
+# compatibility so a schema drift fails fast at load, not silently mid-run.
+BASIS_SCHEMA_VERSION = "1"
+
 
 def fit_pca_model(
     spark,
@@ -51,11 +56,22 @@ def fit_pca_model(
     chunk_bp: int = 25_000_000,
     scores_table: str | None = None,
     local_npz: str | None = None,
+    backend: str = "driver",
 ):
     """LD-prune ``qc_df`` → FRAPOSA fit → write the projectable model npz to ``out_path``.
 
     ``sample_ids`` / ``superpops`` are the dose columns' sample order + labels (superpops
     may be an empty array for an unlabeled cohort). Returns a small summary dict.
+
+    ``backend``:
+      - ``"driver"`` (default) — collect the pruned matrix to the driver, one BLAS ``XᵀX`` + ``eigh``.
+        Byte-identical to the validated FRAPOSA fit; use for the reference basis and cohort scale.
+      - ``"distributed"`` — compute the samples² Gram distributedly (never collect the full n_var ×
+        n_samples matrix), then ``eigh`` the small Gram on the driver and compute loadings
+        distributedly. Lifts the *variant*-axis driver-memory ceiling for large in-cohort GWAS PCA.
+        Numerically equivalent PCA (not bit-identical — different float accumulation order), so the
+        reference basis stays on ``"driver"``. The samples² Gram itself must still fit the driver
+        (~tens of thousands of samples), which is the intrinsic limit of a samples² PCA.
     """
     n_panel = len(sample_ids)
     dim_stu = dim_ref * 2
@@ -102,11 +118,49 @@ def fit_pca_model(
     order_by_vidx = {int(v): i for i, v in enumerate(kept_pd["vidx"].tolist())}
     print(f"pruned loci: {n_var}")
 
-    # --- 2. Fit on the driver — collect the pruned panel (small) → BLAS XᵀX → eigh → loadings ---
-    # The pruned panel is small, so collect it once and fit on the driver: XᵀX is a single BLAS gemm,
-    # and we avoid re-scanning the multi-GB QC store. The standardize/eigh/loadings are verbatim
-    # lib/prs_ancestry.fit_panel_basis (FRAPOSA). (Requires driver.maxResultSize ≥ ~4g for the collect.)
-    kept_rows = qc_df.join(F.broadcast(kept.select("vidx")), "vidx").select("vidx", "dose").collect()
+    # --- 2. Fit → mean/std, eigh(Gram), loadings U_on, pcs_ref (backend-selected) ---
+    kept_dose = qc_df.join(F.broadcast(kept.select("vidx")), "vidx").select("vidx", "dose")
+    if backend == "distributed":
+        mean, std, s_on, V_on, pcs_ref, U_on = _fit_distributed(
+            spark, kept_dose, order_by_vidx, n_var, n_panel, dim_ref, dim_online)
+    elif backend == "driver":
+        mean, std, s_on, V_on, pcs_ref, U_on = _fit_driver(
+            kept_dose, order_by_vidx, n_var, dim_ref, dim_online)
+    else:
+        raise ValueError(f"backend must be 'driver' or 'distributed', got {backend!r}")
+
+    # --- 3. Persist the ONE projectable model (same shape as lib/prs_ancestry.fit_panel_basis) ---
+    local_npz = local_npz or os.path.join(tempfile.gettempdir(), "pca_basis.npz")
+    np.savez(local_npz,
+             loci_chrom=kept_pd["chrom"].astype(str).to_numpy(),
+             loci_pos=kept_pd["pos"].to_numpy(np.int64),
+             loci_ref=kept_pd["ref"].astype(str).to_numpy(),
+             loci_alt=kept_pd["alt"].astype(str).to_numpy(),
+             U_on=U_on, s_on=s_on, V_on=V_on, pcs_ref=pcs_ref, mean=mean, std=std,
+             dim_ref=dim_ref, dim_stu=dim_stu,
+             panel_iids=np.array(sample_ids), superpops=np.asarray(superpops),
+             panel_version=np.array(panel_version),
+             schema_version=np.array(BASIS_SCHEMA_VERSION))
+    shutil.copyfile(local_npz, out_path)                            # out_path is a /Volumes FUSE path
+    print(f"wrote basis → {out_path} | n_loci={n_var} n_panel={n_panel} "
+          f"dim_online={dim_online} panel_version={panel_version}")
+
+    # --- 4. Optional: materialize per-sample scores for covariate consumers (GWAS) ---
+    if scores_table:
+        cols = ["sample_id"] + [f"PC{j + 1}" for j in range(dim_ref)]
+        rows = [(str(sample_ids[i]), *[float(pcs_ref[i, j]) for j in range(dim_ref)]) for i in range(n_panel)]
+        spark.createDataFrame(rows, cols).write.mode("overwrite").option(
+            "overwriteSchema", "true").saveAsTable(scores_table)
+        print(f"wrote scores → {scores_table} ({n_panel} samples × {dim_ref} PCs)")
+
+    return {"n_var": int(n_var), "n_panel": int(n_panel), "dim_online": int(dim_online),
+            "panel_version": panel_version, "out_path": out_path, "backend": backend}
+
+
+def _fit_driver(kept_dose, order_by_vidx, n_var, dim_ref, dim_online):
+    """Collect the pruned matrix to the driver → BLAS XᵀX → eigh → loadings. Verbatim FRAPOSA
+    (byte-identical to the validated basis). Requires driver.maxResultSize ≥ ~4g for the collect."""
+    kept_rows = kept_dose.collect()
     vidx_arr = np.fromiter((r["vidx"] for r in kept_rows), np.int64, len(kept_rows))
     X = np.stack([np.asarray(r["dose"], dtype=np.float32) for r in kept_rows])   # (n_var, n_samples), NaN=missing
     X = X[np.argsort([order_by_vidx[int(v)] for v in vidx_arr])]                 # stable (chrom, pos) order
@@ -133,29 +187,45 @@ def fit_pca_model(
     pcs_ref = V_all[:, :dim_ref] * s_all[:dim_ref]                   # (n_panel × dim_ref)
     U_on = (X @ (V_on / s_on)).astype(np.float64)                    # (n_var × dim_online)
     print(f"eigendecomposition (driver): top s = {np.round(s_on[:dim_ref], 1)}")
+    return mean, std, s_on, V_on, pcs_ref, U_on
 
-    # --- 3. Persist the ONE projectable model (same shape as lib/prs_ancestry.fit_panel_basis) ---
-    local_npz = local_npz or os.path.join(tempfile.gettempdir(), "pca_basis.npz")
-    np.savez(local_npz,
-             loci_chrom=kept_pd["chrom"].astype(str).to_numpy(),
-             loci_pos=kept_pd["pos"].to_numpy(np.int64),
-             loci_ref=kept_pd["ref"].astype(str).to_numpy(),
-             loci_alt=kept_pd["alt"].astype(str).to_numpy(),
-             U_on=U_on, s_on=s_on, V_on=V_on, pcs_ref=pcs_ref, mean=mean, std=std,
-             dim_ref=dim_ref, dim_stu=dim_stu,
-             panel_iids=np.array(sample_ids), superpops=np.asarray(superpops),
-             panel_version=np.array(panel_version))
-    shutil.copyfile(local_npz, out_path)                            # out_path is a /Volumes FUSE path
-    print(f"wrote basis → {out_path} | n_loci={n_var} n_panel={n_panel} "
-          f"dim_online={dim_online} panel_version={panel_version}")
 
-    # --- 4. Optional: materialize per-sample scores for covariate consumers (GWAS) ---
-    if scores_table:
-        cols = ["sample_id"] + [f"PC{j + 1}" for j in range(dim_ref)]
-        rows = [(str(sample_ids[i]), *[float(pcs_ref[i, j]) for j in range(dim_ref)]) for i in range(n_panel)]
-        spark.createDataFrame(rows, cols).write.mode("overwrite").option(
-            "overwriteSchema", "true").saveAsTable(scores_table)
-        print(f"wrote scores → {scores_table} ({n_panel} samples × {dim_ref} PCs)")
+def _fit_distributed(spark, kept_dose, order_by_vidx, n_var, n_panel, dim_ref, dim_online):
+    """Samples² Gram computed distributedly (RowMatrix) → eigh on the driver → loadings computed
+    distributedly. Never collects the full n_var × n_samples matrix, so it lifts the variant-axis
+    driver-memory ceiling for large in-cohort GWAS PCA. Numerically-equivalent (not bit-identical)
+    to the driver fit; PCA sign is arbitrary (fine for covariates). Classic cluster (uses the RDD/
+    mllib API); the samples² Gram must still fit the driver. Reference basis stays on 'driver'."""
+    from pyspark.mllib.linalg import Vectors as MLVectors
+    from pyspark.mllib.linalg.distributed import RowMatrix
 
-    return {"n_var": int(n_var), "n_panel": int(n_panel), "dim_online": int(dim_online),
-            "panel_version": panel_version, "out_path": out_path}
+    def _standardize(row):
+        d = np.asarray(row["dose"], dtype=np.float64)   # length n_panel, NaN = missing
+        obs = d[~np.isnan(d)]
+        m = float(obs.mean()) if obs.size else 0.0
+        s = float(obs.std()) if obs.size else 0.0       # ddof=0, matches FRAPOSA
+        if s == 0.0:
+            s = 1.0
+        z = (d - m) / s
+        z[np.isnan(z)] = 0.0                            # missing → 0 after standardize
+        return (int(row["vidx"]), m, s, z)
+
+    std_rows = kept_dose.rdd.map(_standardize).cache()
+    # RowMatrix Gramian of the standardized variant rows = Σ_v z_v ⊗ z_v = XᵀX (n_panel × n_panel).
+    G = RowMatrix(std_rows.map(lambda t: MLVectors.dense(t[3]))).computeGramianMatrix().toArray()
+    ssq, V = np.linalg.eigh(G)
+    s_all = np.sqrt(np.abs(ssq))[::-1]; V_all = V.T[::-1].T
+    s_on = s_all[:dim_online]; V_on = V_all[:, :dim_online]
+    pcs_ref = V_all[:, :dim_ref] * s_all[:dim_ref]
+
+    # loadings U_on[v] = z_v @ (V_on/s_on): compute distributed, collect (small: n_var × dim_online)
+    Mb = spark.sparkContext.broadcast(V_on / s_on)
+    triples = std_rows.map(lambda t: (t[0], t[1], t[2], (np.asarray(t[3]) @ Mb.value).tolist())).collect()
+    std_rows.unpersist()
+
+    mean = np.zeros((n_var, 1)); std = np.zeros((n_var, 1)); U_on = np.zeros((n_var, dim_online))
+    for vidx, m, s, u in triples:                      # reassemble in stable (chrom, pos) order
+        i = order_by_vidx[int(vidx)]
+        mean[i, 0] = m; std[i, 0] = s; U_on[i, :] = np.asarray(u)
+    print(f"eigendecomposition (distributed Gram): top s = {np.round(s_on[:dim_ref], 1)}")
+    return mean, std, s_on, V_on, pcs_ref, U_on

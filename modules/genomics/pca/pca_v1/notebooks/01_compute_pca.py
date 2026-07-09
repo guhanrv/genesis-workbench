@@ -24,6 +24,7 @@ dbutils.widgets.text("max_variants", "0", "Cap SNPs used (0 = all; M is unbounde
 dbutils.widgets.text("r2", "0.05", "LD-prune r² threshold (prune if ≥)")
 dbutils.widgets.text("window_bp", "1000000", "LD-prune window (bp)")
 dbutils.widgets.text("model_dir", "", "Volume dir to write the projectable model npz (pca_model_<run>.npz)")
+dbutils.widgets.text("backend", "driver", "PCA fit backend: driver (default) | distributed (large cohorts, classic cluster)")
 dbutils.widgets.text("mlflow_run_id", "", "MLflow Run ID")
 
 catalog = dbutils.widgets.get("catalog")
@@ -34,6 +35,7 @@ max_variants = int(dbutils.widgets.get("max_variants"))
 r2 = float(dbutils.widgets.get("r2"))
 window_bp = int(dbutils.widgets.get("window_bp"))
 model_dir = dbutils.widgets.get("model_dir")
+backend = dbutils.widgets.get("backend").strip() or "driver"
 mlflow_run_id = dbutils.widgets.get("mlflow_run_id")
 
 # COMMAND ----------
@@ -101,6 +103,6 @@ pca_fit.fit_pca_model(
     sample_ids=sample_ids, superpops=np.array([]),      # in-cohort: unlabeled (no reference superpops)
     dim_ref=min(n_components, N), r2=r2, window_bp=window_bp,
     panel_version=f"cohort_{run}", out_path=out_path,
-    scores_table=scores_table,
+    scores_table=scores_table, backend=backend,
 )
 print(f"cohort PCA → model {out_path} + scores {scores_table}")

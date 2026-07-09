@@ -92,6 +92,22 @@ _local_basis = "/tmp/" + os.path.basename(basis_path)
 dbutils.fs.cp(basis_path, "file:" + _local_basis)
 _b = np.load(_local_basis, allow_pickle=True)
 
+# --- artifact contract: fail fast if the pca-built basis npz drifted (see pca_v1/lib/pca_fit) ---
+# The basis crosses a module boundary as a Volume artifact, so its schema is an implicit contract.
+# Assert the keys we consume + a matching schema_version, so a producer change breaks here at load
+# with a clear message, not silently mid-projection.
+_EXPECTED_BASIS_SCHEMA = "1"
+_REQUIRED_KEYS = {"loci_chrom", "loci_pos", "loci_ref", "loci_alt", "U_on", "s_on", "V_on",
+                  "pcs_ref", "mean", "std", "dim_ref", "dim_stu", "superpops", "panel_version"}
+_missing = _REQUIRED_KEYS - set(_b.files)
+if _missing:
+    raise ValueError(f"basis {basis_path} is missing keys {sorted(_missing)} — incompatible with this "
+                     f"consumer. Rebuild via pca_v1/ref_01_build_basis (BASIS_SCHEMA_VERSION={_EXPECTED_BASIS_SCHEMA}).")
+_got_schema = str(_b["schema_version"]) if "schema_version" in _b.files else "0"
+if _got_schema != _EXPECTED_BASIS_SCHEMA:
+    raise ValueError(f"basis schema_version={_got_schema} != expected {_EXPECTED_BASIS_SCHEMA} — the pca "
+                     f"basis contract changed. Rebuild via pca_v1/ref_01_build_basis or update this consumer.")
+
 chrom, pos, ref, alt = _b["loci_chrom"], _b["loci_pos"], _b["loci_ref"], _b["loci_alt"]
 n_loci = len(pos)
 dim_ref = int(_b["dim_ref"])
