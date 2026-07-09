@@ -57,9 +57,16 @@ variables:
       runs, per Stage-0). Also the default vcf_dir for extraction.
     default: /Volumes/${var.core_catalog_name}/${var.core_schema_name}/prs_data/incoming
 
+  pca_reference_dir:
+    description: >-
+      Volume dir where the pca module stages the HGDP+1kGP panel (pca owns the ancestry reference).
+      prs reads the panel pgen/pvar from here (build_panel_afreq) as a read-only artifact. Same
+      core catalog+schema as pca_v1, so the path resolves cross-module. Run pca_reference_setup first.
+    default: /Volumes/${var.core_catalog_name}/${var.core_schema_name}/pca_reference/panel
+
   prs_pca_basis:
     description: >-
-      Volume path to the frozen FRAPOSA PCA basis (pca_basis.npz) — the one-time HGDP+1kGP reference
-      that 05_build_sample_ancestry projects members onto for MSP. Built by 00_build_pca_basis (or
-      staged from the validated local build). Ancestry analogue of the panel pgen / pgs_panel_afreq.
-    default: /Volumes/${var.core_catalog_name}/${var.core_schema_name}/prs_reference/panel/pca_basis.npz
+      Volume path to the frozen FRAPOSA PCA basis (pca_basis.npz) that 05_build_sample_ancestry
+      projects members onto for MSP. BUILT BY THE PCA MODULE (pca_v1/03_build_reference_basis);
+      prs consumes it as a read-only artifact. Ancestry analogue of a saved model.
+    default: /Volumes/${var.core_catalog_name}/${var.core_schema_name}/pca_reference/pca_basis.npz

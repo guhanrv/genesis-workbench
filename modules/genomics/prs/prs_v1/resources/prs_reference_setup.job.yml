@@ -3,47 +3,26 @@ resources:
     prs_reference_setup:
       name: prs_reference_setup
 
-      # ONE-TIME reference-artifact builders (run on demand, not per scoring run). Stages the pgsc
-      # HGDP+1kGP panel to the prs_reference volume, then builds the frozen ancestry PCA basis and the
-      # panel allele-frequency table on top of it. Fully Spark-native — NO plink2 or other binaries
-      # (pgenlib for the pgen reads + distributed QC/LD-prune/PCA in Spark). Ephemeral (auto-terminate).
-      # These outputs (panel pgen, pca_basis.npz, pgs_panel_afreq) are the fixed references the scoring
-      # job consumes — build once, reuse across all scoring runs.
+      # ONE-TIME scoring-reference builder (run on demand, not per scoring run). Builds the panel
+      # allele-frequency table (pgs_panel_afreq) used for mean-imputation of missing PGS variants.
+      # Fully Spark-native — NO plink2 (pgenlib reads the panel pgen). Ephemeral (auto-terminate).
+      #
+      # The ANCESTRY reference (HGDP+1kGP panel staging + the frozen PCA basis) is owned by the pca
+      # module now — see pca_v1/resources/pca_reference_setup.job.yml. This job READS that panel as a
+      # read-only Volume artifact (${var.pca_reference_dir}); run pca_reference_setup first.
       #
       # NOTE: build_panel_afreq reads the registered `pgs_weights` (to know which variants to price), so
-      #       run 00_register_catalog (via the prs_scoring job) at least once before it. build_pca_basis
-      #       reads the full panel pgen to QC — TITRATE prs_ref_cluster.num_workers up to parallelize the
-      #       blocked read for a faster one-time build.
+      #       run 00_register_catalog (via the prs_scoring job) at least once before it.
 
       email_notifications:
         on_failure:
           - ${var.current_user}
 
       tasks:
-        # 1 — download + stage the pgsc panel (pgen/pvar.zst/psam/king.cutoff) + derive pvar.parquet.
-        - task_key: download_panel
-          max_retries: 0
-          job_cluster_key: prs_ref_cluster
-          notebook_task:
-            notebook_path: ../notebooks/00_download_panel.py
-            source: WORKSPACE
-
-        # 2 — Spark-native QC + windowed LD-prune + PCA → pca_basis.npz (the ancestry basis).
-        - task_key: build_pca_basis
-          max_retries: 0
-          depends_on:
-            - task_key: download_panel
-          job_cluster_key: prs_ref_cluster
-          notebook_task:
-            notebook_path: ../notebooks/00_build_pca_basis.py
-            source: WORKSPACE
-
-        # 3 — panel allele frequencies for the registered PGS union → pgs_panel_afreq (for mean_impute).
-        #     Requires a prior 00_register_catalog run (reads pgs_weights).
+        # panel allele frequencies for the registered PGS union → pgs_panel_afreq (for mean_impute).
+        # Requires a prior 00_register_catalog run (reads pgs_weights) and the pca panel (read-only).
         - task_key: build_panel_afreq
           max_retries: 0
-          depends_on:
-            - task_key: download_panel
           job_cluster_key: prs_ref_cluster
           notebook_task:
             notebook_path: ../notebooks/04_build_panel_afreq.py
@@ -54,32 +33,16 @@ resources:
           default: ${var.core_catalog_name}
         - name: schema
           default: ${var.core_schema_name}
-        # panel staging (00_download_panel) + where the builders read it from
-        - name: dest_volume_dir
-          default: /Volumes/${var.core_catalog_name}/${var.core_schema_name}/prs_reference/panel
-        - name: panel_dir
-          default: /Volumes/${var.core_catalog_name}/${var.core_schema_name}/prs_reference/panel
-        # PCA basis (00_build_pca_basis) — Spark-native, no plink2 (QC + windowed LD-prune + PCA in Spark)
-        - name: out_path
-          default: ${var.prs_pca_basis}
-        - name: panel_psam
-          default: /Volumes/${var.core_catalog_name}/${var.core_schema_name}/prs_reference/panel/GRCh38_HGDP+1kGP_ALL.psam
-        - name: king_cutoff
-          default: /Volumes/${var.core_catalog_name}/${var.core_schema_name}/prs_reference/panel/GRCh38_HGDP+1kGP.king.cutoff.out.id
-        - name: dim_ref
-          default: "10"
-        - name: panel_version
-          default: pgsc_HGDP+1kGP_v1
-        # panel pgen/pvar — shared by build_pca_basis (QC read) + build_panel_afreq
+        # panel pgen/pvar — read from the pca module's ancestry-reference volume (pca owns the panel)
         - name: panel_pgen
-          default: /Volumes/${var.core_catalog_name}/${var.core_schema_name}/prs_reference/panel/GRCh38_HGDP+1kGP_ALL.pgen
+          default: ${var.pca_reference_dir}/GRCh38_HGDP+1kGP_ALL.pgen
         - name: panel_pvar_parquet
-          default: /Volumes/${var.core_catalog_name}/${var.core_schema_name}/prs_reference/panel/GRCh38_HGDP+1kGP_ALL.pvar.parquet
+          default: ${var.pca_reference_dir}/GRCh38_HGDP+1kGP_ALL.pvar.parquet
         - name: pgs_ids
           default: ""
 
       job_clusters:
-        - job_cluster_key: prs_ref_cluster       # panel download + pgenlib/Spark reference builds (no plink2)
+        - job_cluster_key: prs_ref_cluster       # pgenlib/Spark panel-afreq build (no plink2)
           new_cluster:
             spark_version: 15.4.x-scala2.12
             node_type_id: ${var.cpu_node_type}
@@ -88,11 +51,9 @@ resources:
             num_workers: 0
             spark_conf:
               spark.databricks.cluster.profile: singleNode
-              spark.master: "local[*, 2]"          # cap concurrent LD-prune tasks (each holds a ~25 Mb chunk's dose)
-              # Shrink the JVM heap so the pandas-UDF Python workers (prune) + driver numpy fit have room:
-              # the single-node default heap (~40 GB of 64) starves Python and OOMs the post-QC phases.
+              spark.master: "local[*, 2]"
               spark.driver.memory: "16g"
-              spark.driver.maxResultSize: "8g"     # for the ~2 GB pruned-panel collect in the driver fit
+              spark.driver.maxResultSize: "8g"
             custom_tags:
               ResourceClass: SingleNode
               work_type: prs_reference_setup

@@ -31,6 +31,12 @@ targets:
               new_cluster:
                 aws_attributes:
                   availability: ON_DEMAND
+        pca_reference_setup:
+          job_clusters:
+            - job_cluster_key: pca_ref_cluster
+              new_cluster:
+                aws_attributes:
+                  availability: ON_DEMAND
 
   prod_azure:
     mode: production
@@ -55,6 +61,12 @@ targets:
               new_cluster:
                 azure_attributes:
                   availability: ON_DEMAND_AZURE
+        pca_reference_setup:
+          job_clusters:
+            - job_cluster_key: pca_ref_cluster
+              new_cluster:
+                azure_attributes:
+                  availability: ON_DEMAND_AZURE
 
   prod_gcp:
     mode: production
@@ -76,6 +88,12 @@ targets:
         pca_compute:
           job_clusters:
             - job_cluster_key: pca_ingest_cluster
+              new_cluster:
+                gcp_attributes:
+                  availability: ON_DEMAND_GCP
+        pca_reference_setup:
+          job_clusters:
+            - job_cluster_key: pca_ref_cluster
               new_cluster:
                 gcp_attributes:
                   availability: ON_DEMAND_GCP

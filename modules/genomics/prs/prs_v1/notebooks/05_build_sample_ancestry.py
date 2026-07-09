@@ -8,7 +8,8 @@
 # MAGIC
 # MAGIC **Distribution boundary (the point of this notebook):**
 # MAGIC   - the fixed basis (QC + LD-prune + panel eigendecomposition) is a **one-time reference artifact**
-# MAGIC     (`pca_basis.npz` on the Volume — built by `00_build_pca_basis`, à la pgsc_calc's reference), NOT
+# MAGIC     (`pca_basis.npz` on the Volume — built by the pca module, `pca_v1/03_build_reference_basis`, à la
+# MAGIC     pgsc_calc's reference), NOT
 # MAGIC     recomputed per run;
 # MAGIC   - the **heavy per-sample work is distributed**: gVCF dose extraction at the basis loci (chrom-sharded,
 # MAGIC     the same kernel as `00_extract_dosage`) + the OADP projection (`applyInPandas`, **numpy-only** on
@@ -23,7 +24,7 @@
 
 dbutils.widgets.text("catalog", "genesis_workbench", "Catalog")
 dbutils.widgets.text("schema", "genesis_schema", "Schema")
-dbutils.widgets.text("basis_path", "", "Volume path to pca_basis.npz (from 00_build_pca_basis)")
+dbutils.widgets.text("basis_path", "", "Volume path to pca_basis.npz (from pca_v1/03_build_reference_basis)")
 dbutils.widgets.text("vcf_dir", "", "Dir of gVCFs (each *.vcf.gz / *.g.vcf.gz = one sample)")
 dbutils.widgets.text("vcf_paths", "", "Explicit gVCF paths (comma-sep; overrides vcf_dir)")
 dbutils.widgets.text("fasta_path", "", "GRCh38 FASTA (.fna.bgz) for REF-block resolution")
@@ -86,7 +87,7 @@ import prs_ancestry as anc
 # COMMAND ----------
 
 if not basis_path:
-    raise ValueError("basis_path is required — point it at pca_basis.npz (see 00_build_pca_basis)")
+    raise ValueError("basis_path is required — point it at pca_basis.npz (see pca_v1/03_build_reference_basis)")
 _local_basis = "/tmp/" + os.path.basename(basis_path)
 dbutils.fs.cp(basis_path, "file:" + _local_basis)
 _b = np.load(_local_basis, allow_pickle=True)

@@ -11,3 +11,12 @@ resources:
       schema_name: ${var.core_schema_name}
       name: pca_results
       volume_type: MANAGED
+
+    # Ancestry-reference artifacts owned by pca_v1: the staged HGDP+1kGP panel + the frozen
+    # projectable PCA basis (pca_basis.npz). Consumed cross-module by prs (classify + panel_afreq)
+    # as read-only artifacts — no shared code, just a Volume path.
+    pca_reference_volume:
+      catalog_name: ${var.core_catalog_name}
+      schema_name: ${var.core_schema_name}
+      name: pca_reference
+      volume_type: MANAGED

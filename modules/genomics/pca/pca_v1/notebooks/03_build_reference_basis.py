@@ -1,12 +1,16 @@
 # Databricks notebook source
 # MAGIC %md
-# MAGIC # Build the frozen FRAPOSA PCA basis — Spark-native, distributed (classic; NOT serverless)
+# MAGIC # Build the frozen FRAPOSA PCA basis (reference cohort) — Spark-native, distributed (classic; NOT serverless)
 # MAGIC
-# MAGIC Produces `pca_basis.npz` (the fixed HGDP+1kGP basis `05_build_sample_ancestry` projects members onto)
-# MAGIC **entirely in Spark — no plink2, no binaries.** This is the ancestry analogue of `pgs_panel_ref`: a
-# MAGIC one-time reference artifact, but now built with the same distributed-PCA pattern genesis's
-# MAGIC `pca_v1/01_compute_pca` and Databricks' `cspray` use (Spark ML PCA = a distributed sample-covariance
-# MAGIC eigendecomposition), plus a **Hail-style windowed-r² LD prune** done distributed (per chromosome).
+# MAGIC pca_v1's **reference-cohort** entry point: fits PCA on the frozen HGDP+1kGP panel and emits a
+# MAGIC single **projectable** model `pca_basis.npz` (loadings, per-variant mean/std, loci, reference PC
+# MAGIC scores, superpop labels) that downstream modules consume as a read-only Volume artifact —
+# MAGIC `prs`'s `05_build_sample_ancestry` projects members onto it to classify ancestry (most-similar-pop).
+# MAGIC The sibling `01_compute_pca` is the **in-cohort** entry point (same sample-covariance
+# MAGIC eigendecomposition, scores-only, for GWAS covariates); Task 2 collapses the two into one engine.
+# MAGIC **Entirely in Spark — no plink2, no binaries**, plus a **Hail-style windowed-r² LD prune**
+# MAGIC (distributed, per chromosome). The fit is verbatim FRAPOSA `fit_panel_basis`, so member
+# MAGIC projection/classification downstream is unchanged.
 # MAGIC
 # MAGIC Pipeline (all distributed except the tiny driver-side eigendecomposition):
 # MAGIC   1. **QC read** — pgenlib reads the panel pgen in variant-index BLOCKS (`mapInPandas`), subsets to the
@@ -37,7 +41,7 @@ dbutils.widgets.text("geno", "0.1", "Max per-variant missingness")
 dbutils.widgets.text("r2", "0.05", "LD-prune r² threshold (prune if ≥)")
 dbutils.widgets.text("window_bp", "1000000", "LD-prune window (bp)")
 dbutils.widgets.text("block_size", "20000", "pgenlib variants per QC-read task")
-dbutils.widgets.text("panel_version", "pgsc_HGDP+1kGP_v1", "Basis provenance tag")
+dbutils.widgets.text("panel_version", "pgsc_HGDP+1kGP_v2_nohwe", "Basis provenance tag")
 
 # COMMAND ----------
 
@@ -108,6 +112,14 @@ PV_B = spark.sparkContext.broadcast({
 
 # COMMAND ----------
 
+# QC = autosomal biallelic non-palindromic SNVs, MAF ≥ maf, missing ≤ geno. NO Hardy-Weinberg
+# filter — deliberately. Pooled HWE across a multi-ancestry panel (HGDP+1kGP spans 6 superpops)
+# rejects exactly the high-Fst, ancestry-informative variants PCA needs (Wahlund effect: real
+# between-population allele-frequency structure reads as a pooled HWE departure). Measured on this
+# panel: the variants a pooled-HWE filter drops skew ~2.7× higher in per-population Fst than the
+# kept set — i.e. it discards ancestry signal, not noise. Dropping HWE grows the basis from ~47k to
+# ~157k loci and is what the validated pipeline uses (panel_version pgsc_HGDP+1kGP_v2_nohwe). Do NOT
+# re-add an HWE filter here without re-checking that Fst delta.
 _PAL = ({"A", "T"}, {"C", "G"})
 QC_SCHEMA = StructType([
     StructField("vidx", LongType()), StructField("chrom", StringType()), StructField("pos", LongType()),

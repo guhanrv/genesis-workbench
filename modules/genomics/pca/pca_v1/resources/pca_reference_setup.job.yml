@@ -1,0 +1,85 @@
+resources:
+  jobs:
+    pca_reference_setup:
+      name: pca_reference_setup
+
+      # ONE-TIME ancestry-reference builder (run on demand, not per compute). Stages the pgsc
+      # HGDP+1kGP panel to the pca_reference volume, then builds the frozen, projectable FRAPOSA PCA
+      # basis on top of it. Fully Spark-native — NO plink2 or other binaries (pgenlib for the pgen
+      # read + distributed QC/LD-prune, driver-side eigendecomposition). Ephemeral (auto-terminate).
+      #
+      # The output pca_basis.npz is the fixed reference that downstream modules consume as a read-only
+      # Volume artifact (no shared code): prs projects members onto it (classify → most_similar_pop),
+      # and it is the ancestry analogue of a saved model. A large in-cohort GWAS PCA uses the same
+      # engine on a study cohort (see 01_compute_pca) — this job is the reference-cohort entry point.
+
+      email_notifications:
+        on_failure:
+          - ${var.current_user}
+
+      tasks:
+        # 1 — download + stage the pgsc panel (pgen/pvar.zst/psam/king.cutoff) + derive pvar.parquet.
+        - task_key: download_panel
+          max_retries: 0
+          job_cluster_key: pca_ref_cluster
+          notebook_task:
+            notebook_path: ../notebooks/00_download_panel.py
+            source: WORKSPACE
+
+        # 2 — Spark-native QC + windowed LD-prune + PCA → pca_basis.npz (the projectable basis).
+        - task_key: build_reference_basis
+          max_retries: 0
+          depends_on:
+            - task_key: download_panel
+          job_cluster_key: pca_ref_cluster
+          notebook_task:
+            notebook_path: ../notebooks/03_build_reference_basis.py
+            source: WORKSPACE
+
+      parameters:
+        - name: catalog
+          default: ${var.core_catalog_name}
+        - name: schema
+          default: ${var.core_schema_name}
+        # panel staging (00_download_panel) + where the builder reads it from
+        - name: dest_volume_dir
+          default: ${var.pca_reference_dir}
+        - name: panel_dir
+          default: ${var.pca_reference_dir}
+        # PCA basis (03_build_reference_basis) — Spark-native, no plink2
+        - name: out_path
+          default: ${var.pca_basis}
+        - name: panel_psam
+          default: ${var.pca_reference_dir}/GRCh38_HGDP+1kGP_ALL.psam
+        - name: king_cutoff
+          default: ${var.pca_reference_dir}/GRCh38_HGDP+1kGP.king.cutoff.out.id
+        - name: dim_ref
+          default: "10"
+        - name: panel_version
+          default: pgsc_HGDP+1kGP_v2_nohwe
+        - name: panel_pgen
+          default: ${var.pca_reference_dir}/GRCh38_HGDP+1kGP_ALL.pgen
+        - name: panel_pvar_parquet
+          default: ${var.pca_reference_dir}/GRCh38_HGDP+1kGP_ALL.pvar.parquet
+
+      job_clusters:
+        - job_cluster_key: pca_ref_cluster        # panel download + pgenlib/Spark reference build (no plink2)
+          new_cluster:
+            spark_version: 15.4.x-scala2.12
+            node_type_id: ${var.cpu_node_type}
+            data_security_mode: SINGLE_USER
+            runtime_engine: STANDARD
+            num_workers: 0
+            spark_conf:
+              spark.databricks.cluster.profile: singleNode
+              spark.master: "local[*, 2]"          # cap concurrent LD-prune tasks (each holds a ~25 Mb chunk's dose)
+              # Shrink the JVM heap so the pandas-UDF Python workers (prune) + driver numpy fit have room:
+              # the single-node default heap (~40 GB of 64) starves Python and OOMs the post-QC phases.
+              spark.driver.memory: "16g"
+              spark.driver.maxResultSize: "8g"     # for the ~2 GB pruned-panel collect in the driver fit
+            custom_tags:
+              ResourceClass: SingleNode
+              work_type: pca_reference_setup
+            enable_elastic_disk: true
+
+      tags: ${var.common_resource_tags}
