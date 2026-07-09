@@ -34,31 +34,28 @@ Six tasks, all on **classic** job clusters (fixed `num_workers`, started minimal
 
 ```
 setup_stores → register → extract_dosage → reconcile ──────────┐
-                                        └→ build_sample_ancestry ┴→ score_prs
+                                        └→ build_sample_ancestry ┴→ score_prs → save_results → mark_success/failure
 ```
 
 - **`00_setup_stores`** — idempotent DDL for the stores above.
 - **`00_register_catalog`** — curation (`prs.yaml` + scorefiles) → `pgs_registry` / `pgs_weights` / `pgs_panel_ref`. Palindromic (A/T, C/G) SNPs dropped (strand-ambiguous).
-- **`00_extract_dosage`** — per-sample gVCF → `dosage`, one Spark task per (sample × chrom). Uses the ported pysam **END-block + FASTA** kernel (`lib/gvcf_dose.py`): plink2 and Glow both drop gVCF `END=` REF blocks (~70% coverage loss), so this can't be Glow/SQL. Incremental: skips samples already extracted.
+- **`00_extract_dosage`** — per-sample **gVCF** → `dosage`, one Spark task per (sample × chrom). Uses the ported pysam **END-block + FASTA** kernel (`lib/gvcf_dose.py`): plink2 and Glow both drop gVCF `END=` REF blocks (~70% coverage loss), so this can't be Glow/SQL. Incremental: skips samples already extracted. *(Non-gVCF cohorts use the sibling engine `00_ingest_vcf` — Glow `DS/HDS/GT`, imputed-dosage or regular hard-called VCF — which orients + MERGEs into the SAME `dosage` store, so everything downstream is identical.)*
 - **`02_reconcile`** — the incremental brain + cost kill-switch. Anti-joins the desired `(sample × pgs)` grid vs `prs_scores` → emits **only missing/stale cells**. **Dry-run by default** (`apply=false`): prints the cell count + estimated cost and scores nothing; a plan larger than `max_cells` additionally needs `confirm_large=true`. A stray run can never fire the full grid.
 - **`05_build_sample_ancestry`** — OADP-projects each sample onto the frozen FRAPOSA PCA basis (`lib/prs_ancestry.py`) → RF most-similar-pop → `sample_ancestry`. Extraction distributed like `extract_dosage`; RF classify on the driver.
 - **`01_score_prs`** — SQL join-aggregate over the reconcile plan → `raw`, then reference-panel `z_msp` + RF-posterior-weighted `z_admixed` → MERGE `prs_scores`. Default `missing_mode=drop`; `mean_impute` uses `pgs_panel_afreq` (2·AF).
+- **`02_save_results`** — read `prs_scores` → log cohort summary metrics (coverage, z_msp/z_admixed counts, raw distribution) to the MLflow run. `mark_success` / `mark_failure` then set the run's `job_status` (framework convention).
 
-`mark_success` / `mark_failure` update the MLflow run's `job_status` (framework convention).
+## Two ingest engines (both write the shared `dosage` store)
 
-## One-time reference setup (run manually / out-of-band, like the panel download)
+| cohort | engine | notebook |
+|---|---|---|
+| **gVCF** (`END=` REF blocks) | pysam END-block + FASTA kernel | `00_extract_dosage` (in the scoring DAG) |
+| **imputed dosage / regular hard-called VCF** (`DS`/`HDS`/`GT`) | Glow, distributed | `00_ingest_vcf` (guards against gVCF input) |
 
-These build the frozen reference artifacts on the `prs_reference` volume; they are **not** part
-of the per-run scoring DAG (run once, reused):
+## Companion jobs
 
-- **`00_download_panel`** — fetch the pgsc HGDP+1kGP panel (pgen/pvar.zst/psam/king.cutoff) + derive `pvar.parquet`.
-- **`00_build_pca_basis`** — QC + LD-prune the panel (plink2) → FRAPOSA fit → `pca_basis.npz` (the ancestry basis `05` projects onto).
-- **`04_build_panel_afreq`** — panel allele frequencies for the registered PGS union → `pgs_panel_afreq` (for `mean_impute`).
-- **`00_download_pgs_scorefile`** — fetch a harmonized GRCh38 scoring file into `prs_reference`.
-- **`03_maintain_stores`** — OPTIMIZE + VACUUM + ANALYZE (scheduled maintenance).
-
-The hard-called / imputed-VCF ingest path (`00_ingest_hardcalled`, Glow DS/HDS/GT) is an
-alternative to the gVCF extractor for cohorts that aren't gVCF.
+- **`prs_reference_setup`** — one-time reference builders (run on demand): `00_download_panel` → `00_build_pca_basis` (`pca_basis.npz`) + `04_build_panel_afreq` (`pgs_panel_afreq`). `00_download_pgs_scorefile` runs in `prs_initial_setup_job`.
+- **`prs_maintenance`** — scheduled (paused) `03_maintain_stores`: OPTIMIZE + VACUUM + ANALYZE so MERGE versioning doesn't balloon.
 
 ## Key parameters (`prs_scoring`)
 

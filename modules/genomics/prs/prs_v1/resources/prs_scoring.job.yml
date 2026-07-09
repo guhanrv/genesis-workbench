@@ -84,12 +84,24 @@ resources:
             notebook_path: ../notebooks/01_score_prs.py
             source: WORKSPACE
 
-        # 6 — MLflow run status (framework convention; matches pca/gwas). No-ops when
+        # 6 — publish results + log cohort summary metrics to MLflow (mirrors pca/gwas save_results).
+        - task_key: save_results
+          max_retries: 0
+          depends_on:
+            - task_key: score_prs
+          job_cluster_key: prs_light_cluster
+          notebook_task:
+            notebook_path: ../notebooks/02_save_results.py
+            source: WORKSPACE
+            base_parameters:
+              mlflow_run_id: "{{job.parameters.mlflow_run_id}}"
+
+        # 7 — MLflow run status (framework convention; matches pca/gwas). No-ops when
         #     mlflow_run_id is empty (a manual run not launched via batch-model invocation).
         - task_key: mark_success
           max_retries: 0
           depends_on:
-            - task_key: score_prs
+            - task_key: save_results
           run_if: ALL_SUCCESS
           job_cluster_key: prs_light_cluster
           notebook_task:
@@ -102,7 +114,7 @@ resources:
         - task_key: mark_failure
           max_retries: 0
           depends_on:
-            - task_key: score_prs
+            - task_key: save_results
           run_if: AT_LEAST_ONE_FAILED
           job_cluster_key: prs_light_cluster
           notebook_task:

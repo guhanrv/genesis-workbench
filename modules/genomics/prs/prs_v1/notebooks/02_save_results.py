@@ -1,21 +1,24 @@
 # Databricks notebook source
 # MAGIC %md
-# MAGIC # Save PRS Results and Update MLflow
+# MAGIC # Publish PRS results + log summary metrics to MLflow
 # MAGIC
-# MAGIC Reads the per-sample PRS Delta table, computes cohort summary statistics,
-# MAGIC and records them on the MLflow run.
+# MAGIC Terminal step of the scoring DAG. Reads the fixed `prs_scores` cell-store (written by
+# MAGIC `01_score_prs`) and records cohort-level summary metrics on the MLflow run — coverage, how many
+# MAGIC cells carried a reference-panel `z_msp` / admixed `z_admixed`, and the raw-score distribution. Mirrors
+# MAGIC `pca_v1/02_save_results`. (Per-run wide result tables are gone — results live in the MERGE-upserted
+# MAGIC `prs_scores`; this step summarizes what the run produced rather than re-materializing it.)
 
 # COMMAND ----------
 
 dbutils.widgets.text("catalog", "genesis_workbench", "Catalog")
 dbutils.widgets.text("schema", "genesis_schema", "Schema")
-dbutils.widgets.text("pgs_id", "", "PGS id")
+dbutils.widgets.text("pgs_ids", "", "Restrict summary to these PGS (comma-sep; empty = all in prs_scores)")
 dbutils.widgets.text("mlflow_run_id", "", "MLflow Run ID")
 dbutils.widgets.text("user_email", "a@b.com", "User Email")
 
 catalog = dbutils.widgets.get("catalog")
 schema = dbutils.widgets.get("schema")
-pgs_id = dbutils.widgets.get("pgs_id")
+pgs_filter = [x.strip() for x in dbutils.widgets.get("pgs_ids").split(",") if x.strip()]
 mlflow_run_id = dbutils.widgets.get("mlflow_run_id")
 
 # COMMAND ----------
@@ -26,21 +29,26 @@ mlflow_run_id = dbutils.widgets.get("mlflow_run_id")
 
 import pyspark.sql.functions as F
 
-results_table = f"prs_scores_{mlflow_run_id.replace('-', '_')}"
-df = spark.table(f"{catalog}.{schema}.{results_table}")
+df = spark.table(f"{catalog}.{schema}.prs_scores")
+if pgs_filter:
+    df = df.where(F.col("pgs_id").isin(pgs_filter))
 
 agg = df.agg(
-    F.count("*").alias("n_samples"),
-    F.mean("prs_raw").alias("mean_raw"),
-    F.stddev_pop("prs_raw").alias("sd_raw"),
-    F.mean("n_variants_matched").alias("mean_variants_matched"),
-    F.min("n_variants_matched").alias("min_variants_matched"),
+    F.count("*").alias("n_cells"),
+    F.countDistinct("sample_id").alias("n_samples"),
+    F.countDistinct("pgs_id").alias("n_pgs"),
+    F.mean("raw_score").alias("mean_raw"),
+    F.stddev_pop("raw_score").alias("sd_raw"),
+    F.mean("coverage_pct").alias("mean_coverage_pct"),
+    F.mean(F.col("small_score").cast("double")).alias("frac_small_score"),
+    F.sum(F.col("z_msp").isNotNull().cast("int")).alias("n_z_msp"),
+    F.sum(F.col("z_admixed").isNotNull().cast("int")).alias("n_z_admixed"),
 ).first()
 
-n_samples = agg["n_samples"]
-print(f"PRS samples scored: {n_samples}")
-print(f"mean raw={agg['mean_raw']}, sd raw={agg['sd_raw']}")
-print(f"variants matched per sample: mean={agg['mean_variants_matched']}, min={agg['min_variants_matched']}")
+print(f"prs_scores: {agg['n_cells']} cells · {agg['n_samples']} samples × {agg['n_pgs']} PGS")
+print(f"raw: mean={agg['mean_raw']}, sd={agg['sd_raw']} | mean coverage={agg['mean_coverage_pct']}%")
+print(f"normalized: z_msp on {agg['n_z_msp']} cells, z_admixed on {agg['n_z_admixed']} cells | "
+      f"small_score frac={agg['frac_small_score']}")
 
 # COMMAND ----------
 
@@ -49,16 +57,15 @@ import mlflow
 mlflow.set_registry_uri("databricks-uc")
 mlflow.set_tracking_uri("databricks")
 
-with mlflow.start_run(run_id=mlflow_run_id):
-    mlflow.log_param("pgs_id", pgs_id)
-    mlflow.log_param("results_table", f"{catalog}.{schema}.{results_table}")
-    mlflow.log_metric("n_samples_scored", n_samples)
-    if agg["mean_raw"] is not None:
-        mlflow.log_metric("mean_prs_raw", float(agg["mean_raw"]))
-    if agg["mean_variants_matched"] is not None:
-        mlflow.log_metric("mean_variants_matched", float(agg["mean_variants_matched"]))
-    if agg["min_variants_matched"] is not None:
-        mlflow.log_metric("min_variants_matched", float(agg["min_variants_matched"]))
-    mlflow.set_tag("job_status", "prs_complete")
-
-print("PRS scoring complete — MLflow run updated")
+if mlflow_run_id.strip():
+    with mlflow.start_run(run_id=mlflow_run_id):
+        mlflow.log_param("results_table", f"{catalog}.{schema}.prs_scores")
+        for k in ("n_cells", "n_samples", "n_pgs", "n_z_msp", "n_z_admixed"):
+            mlflow.log_metric(k, int(agg[k]))
+        for k in ("mean_raw", "sd_raw", "mean_coverage_pct", "frac_small_score"):
+            if agg[k] is not None:
+                mlflow.log_metric(k, float(agg[k]))
+        mlflow.set_tag("job_status", "prs_complete")
+    print("PRS results published — MLflow run updated")
+else:
+    print("no mlflow_run_id — metrics printed only (manual run)")

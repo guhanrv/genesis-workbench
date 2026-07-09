@@ -1,0 +1,53 @@
+resources:
+  jobs:
+    prs_maintenance:
+      name: prs_maintenance
+
+      # Scheduled store maintenance: OPTIMIZE + (optional) VACUUM + ANALYZE on the persistent Delta
+      # stores, so MERGE-upsert versioning doesn't balloon and file layout stays healthy. Classic
+      # single-node, ephemeral. Schedule is PAUSED by default — enable + tune the cron to your cadence.
+
+      email_notifications:
+        on_failure:
+          - ${var.current_user}
+
+      tasks:
+        - task_key: maintain_stores
+          max_retries: 0
+          job_cluster_key: prs_maint_cluster
+          notebook_task:
+            notebook_path: ../notebooks/03_maintain_stores.py
+            source: WORKSPACE
+
+      parameters:
+        - name: catalog
+          default: ${var.core_catalog_name}
+        - name: schema
+          default: ${var.core_schema_name}
+        - name: retention_hours
+          default: "168"
+        - name: run_vacuum
+          default: "true"
+
+      schedule:
+        pause_status: PAUSED
+        quartz_cron_expression: "0 0 8 ? * SUN"   # weekly, Sun 08:00 (UTC) — tune to your cadence
+        timezone_id: UTC
+
+      job_clusters:
+        - job_cluster_key: prs_maint_cluster
+          new_cluster:
+            spark_version: 15.4.x-scala2.12
+            node_type_id: ${var.cpu_node_type}
+            data_security_mode: SINGLE_USER
+            runtime_engine: STANDARD
+            num_workers: 0
+            spark_conf:
+              spark.databricks.cluster.profile: singleNode
+              spark.master: "local[*, 4]"
+            custom_tags:
+              ResourceClass: SingleNode
+              work_type: prs_maintenance
+            enable_elastic_disk: true
+
+      tags: ${var.common_resource_tags}
