@@ -1,0 +1,33 @@
+# PRS curation — the version-controlled SOURCE OF TRUTH for what gets scored.
+#
+# This file is the authoritative curation; the copy at the Volume path the scoring job reads
+# (`catalog_config_path`, default …/prs_reference/prs.yaml) is a DEPLOYMENT of it. Keep this in
+# git and copy it to the Volume as part of setup, e.g.:
+#   databricks fs cp modules/genomics/prs/prs_v1/prs_curation.example.yaml \
+#     dbfs:/Volumes/<catalog>/<schema>/prs_reference/prs.yaml --overwrite
+#
+# Fields per score:
+#   pgs_id / id / disease  — PGS Catalog id + human labels (pgs_registry).
+#   scoring_file           — harmonized PGS-catalog scorefile name in `scorefile_dir` (GRCh38 hmPOS).
+#   reference_distribution — function_prs's FROZEN HGDP+1kGP per-superpop {mean, sd}, built via the
+#                            validated plink2 panel-scoring path. Populates pgs_panel_ref; the scorer
+#                            standardizes raw → z_msp/z_admixed against it.
+#     KEYS MUST BE THE PANEL SUPERPOP CODES (AFR/AMR/CSA/EAS/EUR/MID) — they join by equality to the
+#     ancestry module's most_similar_pop. Full names (European/…) silently produce null z. See
+#     lib/prs_register._PANEL_SUPERPOPS. Omit reference_distribution (or a superpop) → z is null there.
+#
+# `version` is the curation/panel_version: bump it to RESTATE (re-score) all scores against new
+# reference stats; keep it to add a PGS incrementally (only the new column computes).
+version: prs_curation_v1
+scores:
+  - pgs_id: PGS000004
+    id: PGS000004
+    disease: Breast cancer
+    scoring_file: PGS000004_hmPOS_GRCh38.txt.gz
+    reference_distribution:   # validated via function_prs.reference.score_reference_panel (n=3942)
+      AFR: {mean: 0.63957070, sd: 0.53728022}
+      AMR: {mean: 0.42625768, sd: 0.64233228}
+      CSA: {mean: 0.20339816, sd: 0.60054635}
+      EAS: {mean: 0.54053257, sd: 0.56300191}
+      EUR: {mean: 0.09448668, sd: 0.59665090}
+      MID: {mean: 0.34530062, sd: 0.63639149}

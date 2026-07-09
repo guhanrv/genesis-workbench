@@ -44,6 +44,15 @@ variables:
   sql_warehouse_id:
     description: Id of the SQL Warehouse that will be used by the app
 
+  pca_reference_setup_job_id:
+    description: >-
+      Job id of pca_v1's `pca_reference_setup` (a DIFFERENT bundle), used by the top-level
+      `genomics_prs_pipeline` orchestrator to build the ancestry basis before scoring. Cross-bundle
+      job refs can't resolve via ${resources.*}, so it's passed in (set at deploy: `--var
+      pca_reference_setup_job_id=<id>`, or resolved by name from `databricks jobs list`). 0 = the
+      orchestrator's pca step will fail fast with "job 0 not found" until it's set.
+    default: "0"
+
   prs_fasta_ref_cache:
     description: >-
       Volume dir caching the content-addressed FASTA-ref array (keyed by registered-PGS set + FASTA),
