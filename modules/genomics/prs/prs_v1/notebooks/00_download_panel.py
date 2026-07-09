@@ -12,7 +12,7 @@
 # COMMAND ----------
 
 dbutils.widgets.text("dest_volume_dir", "", "Volume dir to stage the panel into")
-dbutils.widgets.text("url", "https://ftp.ebi.ac.uk/pub/databases/spot/pgs/reference/pgsc_HGDP+1kGP_v1.tar.zst", "Panel tar.zst URL")
+dbutils.widgets.text("url", "https://ftp.ebi.ac.uk/pub/databases/spot/pgs/resources/pgsc_HGDP+1kGP_v1.tar.zst", "Panel tar.zst URL")
 
 # COMMAND ----------
 # MAGIC %pip install zstandard
@@ -26,7 +26,10 @@ import zstandard, tarfile
 dest = dbutils.widgets.get("dest_volume_dir").rstrip("/")
 url = dbutils.widgets.get("url")
 assert dest, "set dest_volume_dir"
-WANT = ("GRCh38_HGDP+1kGP_ALL.pgen", "GRCh38_HGDP+1kGP_ALL.psam")   # pgenlib needs the .pgen; psam for metadata
+# Extract pgen (pgenlib genotypes) + psam (metadata) + pvar.zst (variant table → parquet index-map,
+# derived server-side so nothing depends on a local file).
+WANT = ("GRCh38_HGDP+1kGP_ALL.pgen", "GRCh38_HGDP+1kGP_ALL.psam", "GRCh38_HGDP+1kGP_ALL.pvar.zst")
+TO_VOLUME = ("GRCh38_HGDP+1kGP_ALL.pgen", "GRCh38_HGDP+1kGP_ALL.psam")   # + the parquet we build below
 local = "/local_disk0/panel"; os.makedirs(local, exist_ok=True)
 archive = "/local_disk0/pgsc_panel.tar.zst"
 
@@ -57,9 +60,32 @@ print(f"extracted in {time.time()-t:.0f}s: {os.listdir(local)}")
 
 # COMMAND ----------
 
-# 3. copy the panel files to the Volume via FUSE (sequential write — handles large files, unlike the Files API)
+# 3. derive pvar.parquet SERVER-SIDE from the extracted .pvar.zst (index-map for the afreq builder;
+#    reproduces scripts/10_validate/calibrate_prs_with_1000g.load_or_cache_pvar exactly → CHROM,POS,REF,ALT
+#    in pgen order, CHROM without 'chr'). No local upload — fully self-regenerable from the pgsc source.
+import pandas as pd
+pvar_zst = os.path.join(local, "GRCh38_HGDP+1kGP_ALL.pvar.zst")
+pvar_tsv = os.path.join(local, "GRCh38_HGDP+1kGP_ALL.pvar")
+with open(pvar_zst, "rb") as fi, open(pvar_tsv, "wb") as fo:
+    zstandard.ZstdDecompressor().copy_stream(fi, fo, write_size=1 << 24)
+header_lineno = None
+with open(pvar_tsv) as f:
+    for n, line in enumerate(f):
+        if line.startswith("#CHROM"):
+            header_lineno = n; break
+assert header_lineno is not None, "no #CHROM header in pvar"
+pvar = pd.read_csv(pvar_tsv, sep="\t", skiprows=header_lineno,
+                   usecols=["#CHROM", "POS", "REF", "ALT"],
+                   dtype={"#CHROM": "string", "POS": "int64", "REF": "string", "ALT": "string"},
+                   low_memory=False).rename(columns={"#CHROM": "CHROM"})
+pvar["CHROM"] = pvar["CHROM"].astype(str).str.replace(r"^chr", "", regex=True)
+parquet_local = os.path.join(local, "GRCh38_HGDP+1kGP_ALL.pvar.parquet")
+pvar.to_parquet(parquet_local, index=False)
+print(f"built pvar.parquet server-side: {len(pvar):,} variants")
+
+# 4. copy pgen + psam + the derived parquet to the Volume via FUSE (sequential — handles large files)
 os.makedirs(dest, exist_ok=True)
-for base in WANT:
+for base in list(TO_VOLUME) + ["GRCh38_HGDP+1kGP_ALL.pvar.parquet"]:
     src = os.path.join(local, base); dst = os.path.join(dest, base)
     t = time.time(); shutil.copyfile(src, dst)
     print(f"  {base}: {os.path.getsize(dst)/1e9:.2f} GB → {dst}  ({time.time()-t:.0f}s)")
