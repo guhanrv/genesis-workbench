@@ -16,7 +16,9 @@
 
 dbutils.widgets.text("catalog", "genesis_workbench", "Catalog")
 dbutils.widgets.text("schema", "genesis_schema", "Schema")
+dbutils.widgets.text("missing_mode", "drop", "drop = missing→0 (tested default) | mean_impute = missing→2·AF from pgs_panel_afreq")
 catalog = dbutils.widgets.get("catalog"); schema = dbutils.widgets.get("schema")
+missing_mode = dbutils.widgets.get("missing_mode").strip().lower()
 
 # COMMAND ----------
 
@@ -56,14 +58,38 @@ else:
     dose = spark.table("dosage").join(F.broadcast(planned_samples), "sample_id")         # backfill: read all
 wts = spark.table("pgs_weights").join(F.broadcast(planned_pgs), ["pgs_id", "weight_sha"])  # only planned pgs@sha
 
-raw = (
-    dose.join(wts, "variant_id")
-    .groupBy("sample_id", "pgs_id", "weight_sha")
-    .agg(F.sum(F.col("dose") * F.col("weight")).alias("raw_score"),
-         F.count(F.lit(1)).alias("n_variants_matched"))
-    # keep only the exact cells the plan asked for (sparse plans compute nothing extra)
-    .join(plan, ["sample_id", "pgs_id", "weight_sha"])
-)
+# Missing-variant handling (pgsc_calc/plink2 semantics):
+#   drop (default): a PGS variant not covered by the sample contributes 0 (inner join). Correct for
+#     high-coverage WGS gVCF where missing is rare; this is the parity-validated path.
+#   mean_impute: missing → 2·AF(effect) from the frozen panel (pgs_panel_afreq), matching function_prs
+#     mean_impute / plink2 --read-freq. Densifies the join (every planned cell × its PGS' variants), so
+#     it's costlier — worth it for hard-called / low-coverage cohorts where missing is common.
+_use_impute = missing_mode == "mean_impute" and spark.catalog.tableExists("pgs_panel_afreq")
+if missing_mode == "mean_impute" and not _use_impute:
+    print("WARN: missing_mode=mean_impute but pgs_panel_afreq absent → falling back to drop")
+
+if _use_impute:
+    afreq = spark.table("pgs_panel_afreq").select("variant_id", "af_effect")
+    dose_sv = dose.select("sample_id", "variant_id", F.col("dose").alias("_d"))
+    raw = (
+        plan.join(wts, ["pgs_id", "weight_sha"])                       # densify: cell × PGS' variants
+        .join(afreq, "variant_id", "left")
+        .join(dose_sv, ["sample_id", "variant_id"], "left")
+        .withColumn("dose_f", F.coalesce(F.col("_d"), 2.0 * F.col("af_effect"), F.lit(0.0)))  # missing→2·AF (→0 if no panel AF)
+        .groupBy("sample_id", "pgs_id", "weight_sha")
+        .agg(F.sum(F.col("dose_f") * F.col("weight")).alias("raw_score"),
+             F.sum(F.col("_d").isNotNull().cast("int")).alias("n_variants_matched"))  # matched = real coverage
+        .join(plan, ["sample_id", "pgs_id", "weight_sha"])
+    )
+else:
+    raw = (
+        dose.join(wts, "variant_id")
+        .groupBy("sample_id", "pgs_id", "weight_sha")
+        .agg(F.sum(F.col("dose") * F.col("weight")).alias("raw_score"),
+             F.count(F.lit(1)).alias("n_variants_matched"))
+        # keep only the exact cells the plan asked for (sparse plans compute nothing extra)
+        .join(plan, ["sample_id", "pgs_id", "weight_sha"])
+    )
 
 # coverage vs the PGS' total variant count (from registry)
 nvar = spark.table("pgs_registry").select("pgs_id", F.col("n_variants").alias("pgs_nvar"))
