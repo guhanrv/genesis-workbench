@@ -26,9 +26,12 @@ import gzip
 import hashlib
 
 
-# superpop key (as curated in prs.yaml reference_distribution) — stored verbatim
-# as pgs_panel_ref.superpop; the scorer joins it to the PCA module's most_similar_pop.
-_PANEL_SUPERPOPS = ("Admixed", "African", "East_Asian", "European", "Hispanic_Latino", "South_Asian")
+# superpop key (as curated in prs.yaml reference_distribution) — stored verbatim as
+# pgs_panel_ref.superpop; the scorer joins it BY EQUALITY to the PCA module's
+# most_similar_pop (01_score_prs). Those are the HGDP+1kGP panel SuperPop CODES
+# (from the .psam SuperPop column, carried through the PCA basis + RF classifier),
+# so the curated keys must be the same codes or the z-join silently misses.
+_PANEL_SUPERPOPS = ("AFR", "AMR", "CSA", "EAS", "EUR", "MID")
 
 
 def compute_weight_sha(scorefile_path) -> str:
