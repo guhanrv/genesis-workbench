@@ -197,16 +197,20 @@ spark.conf.set("spark.sql.execution.arrow.maxRecordsPerBatch", 100)
 contig_list = [c.strip() for c in contigs.split(",")]
 
 # --- ancestry-PC covariates (from pca_v1's in-cohort PCA) — the fix for confounding by structure ---
-# Empty pca_scores_table → UNADJUSTED (legacy behavior). Otherwise standardize raw → z against the
-# cohort's own PCs: glow aligns covariate_df to phenotype_pdf by index (sampleId), so it must cover
-# every phenotyped sample. Run pca_v1's pca_compute on THIS cohort's VCF first (its pca_components
-# table is the covariates).
+# Empty pca_scores_table → UNADJUSTED (legacy behavior). Otherwise pass the cohort's PCs as fixed
+# regression covariates (glow includes them in the design matrix; they are NOT used to standardize the
+# phenotype). glow aligns covariate_df to phenotype_pdf by index (sampleId), so it must cover every
+# phenotyped sample. Run pca_v1's pca_compute on THIS cohort's VCF first (its pca_components table is
+# the covariates).
 covariate_pdf = pd.DataFrame(index=phenotype_pdf.index)   # empty (no covariates) = unadjusted
 if pca_scores_table:
     tbl = pca_scores_table if "." in pca_scores_table else f"{catalog}.{schema}.{pca_scores_table}"
     cov = spark.table(tbl).toPandas().set_index("sample_id")
     cov.index = cov.index.astype(str)
     cov = cov[[c for c in cov.columns if c.startswith("PC")]]
+    if cov.shape[1] < 1:
+        raise ValueError(f"{tbl} has no PC* columns — not a pca_v1 pca_components table? "
+                         f"Adjustment needs ≥1 PC; refusing to run silently unadjusted.")
     cov = cov.reindex(phenotype_pdf.index)                # align to phenotyped samples, same order
     missing = int(cov.isna().any(axis=1).sum())
     if missing:
