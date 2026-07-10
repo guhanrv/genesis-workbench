@@ -51,11 +51,15 @@ def build_union_catalog(rows) -> UnionCatalog:
         vid = f"{chrom}:{pos}:{effect}:{other}"
         seen[vid] = (str(chrom), int(pos), str(effect), str(other))
     vids = sorted(seen)
-    chrom = np.array([seen[v][0] for v in vids])
+    # dtype=object (pointer per string), NOT the numpy-inferred fixed-width '<U{maxlen}': a single
+    # long indel allele (seen up to ~330 chars in real PGS scorefiles) would pad EVERY element to
+    # that width — <U330 × 17.5M-variant genome-wide union ≈ 23 GB *per array*, OOM-killing the
+    # driver. Object arrays cost ~one pointer + the actual (mostly short) string instead.
+    chrom = np.array([seen[v][0] for v in vids], dtype=object)
     pos = np.array([seen[v][1] for v in vids], dtype=np.int64)
-    eff = np.array([seen[v][2] for v in vids])
-    oth = np.array([seen[v][3] for v in vids])
-    return UnionCatalog(chrom, pos, eff, oth, np.array(vids))
+    eff = np.array([seen[v][2] for v in vids], dtype=object)
+    oth = np.array([seen[v][3] for v in vids], dtype=object)
+    return UnionCatalog(chrom, pos, eff, oth, np.array(vids, dtype=object))
 
 
 def dense_fill(dose: np.ndarray, had_record: np.ndarray, af_effect) -> np.ndarray:
