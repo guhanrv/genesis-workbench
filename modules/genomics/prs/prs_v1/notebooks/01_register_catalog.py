@@ -63,32 +63,6 @@ print(f"curation version={panel_version}; registering {len(scores)} score(s)")
 
 # COMMAND ----------
 
-# --- Parse each score's scorefile → rows for the three stores (all pure, driver-side) ---
-registry_rows, weight_rows, panel_rows = [], [], []
-skipped = []
-for s in scores:
-    pgs_id = s["pgs_id"]
-    path = os.path.join(scorefile_dir, s["scoring_file"])
-    if not os.path.exists(path):
-        skipped.append((pgs_id, s["scoring_file"]))
-        continue
-    sha = R.compute_weight_sha(path)
-    parsed = R.parse_scorefile(path)
-    wr = R.weights_rows(pgs_id, parsed, sha)
-    weight_rows.extend(wr)
-    registry_rows.append(R.registry_row(s, weight_sha=sha, n_variants=len(wr), weight_path=path))
-    panel_rows.extend(R.panel_ref_rows(s, panel_version=panel_version, weight_sha=sha))
-    print(f"  {pgs_id}: {len(wr)} weights, {len(R.panel_ref_rows(s, panel_version, sha))} panel rows, sha={sha[:12]}…")
-
-if skipped:
-    print(f"WARNING: {len(skipped)} scorefile(s) missing in {scorefile_dir} — skipped: {skipped}")
-if not registry_rows:
-    dbutils.notebook.exit("0 — nothing registered (no scorefiles found)")
-
-registered_pgs = [r["pgs_id"] for r in registry_rows]
-
-# COMMAND ----------
-
 # --- Explicit schemas (dicts carry Nones → need typed createDataFrame) ---
 REG_SCHEMA = StructType([
     StructField("pgs_id", StringType()), StructField("score_id", StringType()),
@@ -110,24 +84,67 @@ PANEL_SCHEMA = StructType([
     StructField("panel_version", StringType()), StructField("weight_sha", StringType()),
 ])
 
+# COMMAND ----------
+
+# --- Parse each scorefile → the three stores. Weights (the only large store: a single genome-wide
+#     PGS can be millions of variants, and 100+ of them overflow the driver) are STREAMED to Delta in
+#     bounded batches, so the driver never holds more than ~one big PGS of rows at once. Registry/panel
+#     are one-row-ish per PGS, so they stay in driver lists and MERGE once at the end. ---
+FLUSH_ROWS = 2_000_000        # append pgs_weights once the buffer crosses this (bounds driver memory)
+
+registry_rows, panel_rows, skipped = [], [], []
+registered_pgs = [s["pgs_id"] for s in scores
+                  if os.path.exists(os.path.join(scorefile_dir, s["scoring_file"]))]
+if not registered_pgs:
+    dbutils.notebook.exit("0 — nothing registered (no scorefiles found)")
+
+# pgs_weights is restate-safe: drop the registered PGS' old rows up front, then stream fresh rows in.
+spark.sql(f"DELETE FROM pgs_weights WHERE pgs_id IN ({', '.join(repr(p) for p in registered_pgs)})")
+
+_buf, _n_flushed = [], 0
+def _flush_weights():
+    global _buf, _n_flushed
+    if not _buf:
+        return
+    spark.createDataFrame(_buf, WGT_SCHEMA).write.mode("append").saveAsTable("pgs_weights")
+    _n_flushed += len(_buf)
+    _buf = []
+
+for s in scores:
+    pgs_id = s["pgs_id"]
+    path = os.path.join(scorefile_dir, s["scoring_file"])
+    if not os.path.exists(path):
+        skipped.append((pgs_id, s["scoring_file"]))
+        continue
+    sha = R.compute_weight_sha(path)
+    wr = R.weights_rows(pgs_id, R.parse_scorefile(path), sha)
+    pr = R.panel_ref_rows(s, panel_version=panel_version, weight_sha=sha)
+    registry_rows.append(R.registry_row(s, weight_sha=sha, n_variants=len(wr), weight_path=path))
+    panel_rows.extend(pr)
+    _buf.extend(wr)
+    print(f"  {pgs_id}: {len(wr)} weights, {len(pr)} panel rows, sha={sha[:12]}…")
+    if len(_buf) >= FLUSH_ROWS:
+        _flush_weights()
+_flush_weights()   # final partial batch
+
+if skipped:
+    print(f"WARNING: {len(skipped)} scorefile(s) missing in {scorefile_dir} — skipped: {skipped}")
+print(f"pgs_weights: streamed {_n_flushed} weight rows across {len(registered_pgs)} PGS")
+
+# COMMAND ----------
+
 reg_df = spark.createDataFrame(registry_rows, REG_SCHEMA).withColumn("registered_at", F.current_timestamp())
-wgt_df = spark.createDataFrame(weight_rows, WGT_SCHEMA)
 panel_df = spark.createDataFrame(panel_rows, PANEL_SCHEMA)
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ### Write — weights via per-PGS replace (restate-safe), registry/panel via keyed MERGE
-# MAGIC Replacing only the registered `pgs_id`s' weights makes a restatement drop stale variants without
-# MAGIC touching the other PGS. Registry (key `pgs_id`) and panel (key `pgs_id,superpop,panel_version`)
+# MAGIC ### Write — registry/panel via keyed MERGE (weights already streamed above)
+# MAGIC Weights were replaced per-PGS as they parsed (restate-safe: only the registered `pgs_id`s' rows
+# MAGIC were dropped/rewritten). Registry (key `pgs_id`) and panel (key `pgs_id,superpop,panel_version`)
 # MAGIC MERGE-upsert. All idempotent: re-running the same curation is a no-op change.
 
 # COMMAND ----------
-
-# pgs_weights: delete the registered PGS' rows, then append the fresh set (per-PGS scoped).
-in_list = ", ".join(f"'{p}'" for p in registered_pgs)
-spark.sql(f"DELETE FROM pgs_weights WHERE pgs_id IN ({in_list})")
-wgt_df.write.mode("append").saveAsTable("pgs_weights")
 
 # pgs_registry: one row per pgs_id.
 (DeltaTable.forName(spark, f"{catalog}.{schema}.pgs_registry").alias("t")
