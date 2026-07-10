@@ -35,14 +35,18 @@ schema = dbutils.widgets.get("schema")
 
 import os
 import yaml
+import pandas as pd
 import pyspark.sql.functions as F
 from pyspark.sql.types import (StructType, StructField, StringType, DoubleType, LongType,
                                ArrayType, TimestampType)
 from delta.tables import DeltaTable
 
-# import the pure parsers from the module lib (staged next to the notebooks in the workspace)
+# import the pure parsers from the module lib (driver import for schemas; addPyFile ships it to the
+# executors so the distributed scorefile parse below can `import prs_register` in each task).
 import sys
-sys.path.append(os.path.abspath(os.path.join(os.getcwd(), "..", "lib")))
+lib_dir = os.path.abspath(os.path.join(os.getcwd(), "..", "lib"))
+sys.path.append(lib_dir)
+spark.sparkContext.addPyFile(os.path.join(lib_dir, "prs_register.py"))
 import prs_register as R
 
 spark.sql(f"USE CATALOG {catalog}")
@@ -86,52 +90,63 @@ PANEL_SCHEMA = StructType([
 
 # COMMAND ----------
 
-# --- Parse each scorefile → the three stores. Weights (the only large store: a single genome-wide
-#     PGS can be millions of variants, and 100+ of them overflow the driver) are STREAMED to Delta in
-#     bounded batches, so the driver never holds more than ~one big PGS of rows at once. Registry/panel
-#     are one-row-ish per PGS, so they stay in driver lists and MERGE once at the end. ---
-FLUSH_ROWS = 2_000_000        # append pgs_weights once the buffer crosses this (bounds driver memory)
-
-registry_rows, panel_rows, skipped = [], [], []
-registered_pgs = [s["pgs_id"] for s in scores
-                  if os.path.exists(os.path.join(scorefile_dir, s["scoring_file"]))]
+# --- Weights parse: DISTRIBUTED, one Spark task per scorefile (mapInPandas). Parsing 100+ gzip
+#     scorefiles (some genome-wide, millions of lines) on the DRIVER was serial — ~1 core of N, the
+#     module's slowest task by far. Ship the paths to executors instead: each parses its file (gzip +
+#     effect-orientation + palindromic drop, all in prs_register) and emits its weight rows, written to
+#     pgs_weights in ONE distributed pass. Nothing accumulates on the driver, so this both parallelizes
+#     the parse AND removes the driver-memory ceiling (no batching needed). ---
+present = [(s["pgs_id"], os.path.join(scorefile_dir, s["scoring_file"])) for s in scores
+           if os.path.exists(os.path.join(scorefile_dir, s["scoring_file"]))]
+registered_pgs = [p for p, _ in present]
+skipped = [(s["pgs_id"], s["scoring_file"]) for s in scores
+           if not os.path.exists(os.path.join(scorefile_dir, s["scoring_file"]))]
 if not registered_pgs:
     dbutils.notebook.exit("0 — nothing registered (no scorefiles found)")
 
-# pgs_weights is restate-safe: drop the registered PGS' old rows up front, then stream fresh rows in.
+_WGT_COLS = ["pgs_id", "variant_id", "effect_allele", "other_allele", "weight", "weight_sha"]
+
+def _parse_files(itr):
+    """One task per scorefile path: sha + parse + effect-oriented dedup → weight-row DataFrame."""
+    import prs_register as _R           # shipped via addPyFile
+    for pdf in itr:
+        for _, r in pdf.iterrows():
+            sha = _R.compute_weight_sha(r["path"])
+            wr = _R.weights_rows(r["pgs_id"], _R.parse_scorefile(r["path"]), sha)
+            if wr:
+                yield pd.DataFrame(wr, columns=_WGT_COLS)
+
+# one partition per file → up to (num cores) files parsed concurrently
+paths_df = spark.createDataFrame(present, ["pgs_id", "path"]).repartition(len(present))
+weights_df = paths_df.mapInPandas(_parse_files, schema=WGT_SCHEMA)
+
+# pgs_weights is restate-safe: drop the registered PGS' old rows, then write the fresh set in one pass.
 spark.sql(f"DELETE FROM pgs_weights WHERE pgs_id IN ({', '.join(repr(p) for p in registered_pgs)})")
-
-_buf, _n_flushed = [], 0
-def _flush_weights():
-    global _buf, _n_flushed
-    if not _buf:
-        return
-    spark.createDataFrame(_buf, WGT_SCHEMA).write.mode("append").saveAsTable("pgs_weights")
-    _n_flushed += len(_buf)
-    _buf = []
-
-for s in scores:
-    pgs_id = s["pgs_id"]
-    path = os.path.join(scorefile_dir, s["scoring_file"])
-    if not os.path.exists(path):
-        skipped.append((pgs_id, s["scoring_file"]))
-        continue
-    sha = R.compute_weight_sha(path)
-    wr = R.weights_rows(pgs_id, R.parse_scorefile(path), sha)
-    pr = R.panel_ref_rows(s, panel_version=panel_version, weight_sha=sha)
-    registry_rows.append(R.registry_row(s, weight_sha=sha, n_variants=len(wr), weight_path=path))
-    panel_rows.extend(pr)
-    _buf.extend(wr)
-    print(f"  {pgs_id}: {len(wr)} weights, {len(pr)} panel rows, sha={sha[:12]}…")
-    if len(_buf) >= FLUSH_ROWS:
-        _flush_weights()
-_flush_weights()   # final partial batch
+weights_df.write.mode("append").saveAsTable("pgs_weights")
 
 if skipped:
     print(f"WARNING: {len(skipped)} scorefile(s) missing in {scorefile_dir} — skipped: {skipped}")
-print(f"pgs_weights: streamed {_n_flushed} weight rows across {len(registered_pgs)} PGS")
 
 # COMMAND ----------
+
+# --- Registry + panel rows (small, one-ish per PGS) built on the driver from the curation + the
+#     just-written weights. n_variants / weight_sha per PGS are read back from pgs_weights (distributed
+#     groupBy, not a driver parse), so registry reflects exactly what was written (post dedup/drop). ---
+nv = {r["pgs_id"]: (r["n_variants"], r["weight_sha"]) for r in
+      spark.table("pgs_weights").where(F.col("pgs_id").isin(registered_pgs))
+      .groupBy("pgs_id").agg(F.count("*").alias("n_variants"),
+                             F.first("weight_sha").alias("weight_sha")).collect()}
+
+registry_rows, panel_rows = [], []
+path_by_pgs = dict(present)
+for s in scores:
+    pgs_id = s["pgs_id"]
+    if pgs_id not in nv:
+        continue
+    n_variants, sha = nv[pgs_id]
+    registry_rows.append(R.registry_row(s, weight_sha=sha, n_variants=n_variants, weight_path=path_by_pgs[pgs_id]))
+    panel_rows.extend(R.panel_ref_rows(s, panel_version=panel_version, weight_sha=sha))
+print(f"pgs_weights: wrote {sum(v[0] for v in nv.values())} weight rows across {len(registered_pgs)} PGS")
 
 reg_df = spark.createDataFrame(registry_rows, REG_SCHEMA).withColumn("registered_at", F.current_timestamp())
 panel_df = spark.createDataFrame(panel_rows, PANEL_SCHEMA)
@@ -139,9 +154,9 @@ panel_df = spark.createDataFrame(panel_rows, PANEL_SCHEMA)
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ### Write — registry/panel via keyed MERGE (weights already streamed above)
-# MAGIC Weights were replaced per-PGS as they parsed (restate-safe: only the registered `pgs_id`s' rows
-# MAGIC were dropped/rewritten). Registry (key `pgs_id`) and panel (key `pgs_id,superpop,panel_version`)
+# MAGIC ### Write — registry/panel via keyed MERGE (weights written distributed above)
+# MAGIC Weights were replaced for the registered `pgs_id`s (restate-safe: only their rows were
+# MAGIC dropped/rewritten). Registry (key `pgs_id`) and panel (key `pgs_id,superpop,panel_version`)
 # MAGIC MERGE-upsert. All idempotent: re-running the same curation is a no-op change.
 
 # COMMAND ----------
