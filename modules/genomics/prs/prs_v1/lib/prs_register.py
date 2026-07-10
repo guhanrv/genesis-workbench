@@ -49,9 +49,10 @@ def parse_scorefile(scorefile_path):
     """Harmonized PGS-catalog scoring file → list of (chrom, pos, effect, other, weight).
 
     Uses harmonized columns when present (hm_chr/hm_pos), else the author columns
-    (chr_name/chr_position); other-allele falls back to reference_allele. ``chrom`` is
-    stripped of a leading ``chr`` (ensembl style, matching gvcf_dose/prs_extract).
-    Rows with no position are skipped.
+    (chr_name/chr_position); other-allele falls back reference_allele → hm_inferOtherAllele
+    (the PGS-catalog harmonizer's inferred other allele — some scorefiles carry ONLY this).
+    ``chrom`` is stripped of a leading ``chr`` (ensembl style, matching gvcf_dose/prs_extract).
+    Rows with no position (or no resolvable other allele) are skipped.
     """
     rows = []
     with gzip.open(scorefile_path, "rt") as f:
@@ -66,9 +67,14 @@ def parse_scorefile(scorefile_path):
                 ix = {k: i for i, k in enumerate(hdr)}
                 cch = "hm_chr" if "hm_chr" in ix else "chr_name"
                 cps = "hm_pos" if "hm_pos" in ix else "chr_position"
-                coa = "other_allele" if "other_allele" in ix else "reference_allele"
+                coa = next((col for col in ("other_allele", "reference_allele",
+                                            "hm_inferOtherAllele") if col in ix), None)
+                if coa is None:
+                    raise ValueError(
+                        f"{scorefile_path}: no other/reference/hm_inferOtherAllele column "
+                        f"(cols={hdr}) — cannot form chrom:pos:effect:other variant_id")
                 continue
-            if not c[ix[cps]]:
+            if not c[ix[cps]] or not c[ix[coa]]:
                 continue
             rows.append((
                 str(c[ix[cch]]).replace("chr", ""),
