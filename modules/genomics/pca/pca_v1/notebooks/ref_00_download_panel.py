@@ -4,7 +4,9 @@
 # MAGIC
 # MAGIC Fetches the PGS Catalog reference panel and stages the GRCh38 pgen+psam to a Volume, so the panel
 # MAGIC allele-freq store (`04_build_panel_afreq`) is regenerable entirely on the workspace — no 12 GB
-# MAGIC local upload. Source: `https://ftp.ebi.ac.uk/pub/databases/spot/pgs/reference/pgsc_HGDP+1kGP_v1.tar.zst`
+# MAGIC local upload. Source: `https://ftp.ebi.ac.uk/pub/databases/spot/pgs/resources/pgsc_HGDP+1kGP_v1.tar.zst`
+# MAGIC (matches the `url` widget default below). The archive is the pgsc `_v1` panel; the basis provenance
+# MAGIC tag defaults to `..._v2_nohwe` — "v2" marks OUR no-pooled-HWE QC of that panel, not a new release.
 # MAGIC (gnomAD-derived HGDP+1kGP, processed by the PGS Catalog; same panel that produced the frozen
 # MAGIC reference distributions). Decompress via Python `zstandard`+`tarfile` (no zstd binary needed).
 # MAGIC Classic cluster with local disk + outbound internet.

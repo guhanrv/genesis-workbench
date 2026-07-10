@@ -75,7 +75,7 @@ def fit_pca_model(
     """
     n_panel = len(sample_ids)
     dim_stu = dim_ref * 2
-    dim_online = dim_stu * 2
+    dim_online = min(dim_stu * 2, n_panel)   # clamp: eigh yields only n_panel eigenvectors (tiny cohorts)
 
     # --- 1. Distributed LD prune (per chrom × chunk; Hail-style windowed greedy r²) ---
     PRUNE_SCHEMA = StructType([

@@ -18,12 +18,16 @@ resources:
             notebook_path: ../notebooks/00_ingest_vcf.py
             source: WORKSPACE
 
-        # Step 2+ — pure Spark/MLlib on the Delta table, runs on serverless (no Glow, no RDD).
+        # Step 2 — QC + shared FRAPOSA fit (lib/pca_fit) on the dosage Delta. Classic single-node: the
+        # fit collects the pruned matrix to the driver for the eigh (needs a real driver, not serverless's
+        # fixed one), and backend=distributed uses the RDD/MLlib API which serverless doesn't expose — so
+        # this task must be classic for BOTH backends to run. Save/mark tasks stay serverless (light).
         - task_key: compute_pca
           max_retries: 0
+          timeout_seconds: 21600
           depends_on:
             - task_key: ingest_vcf
-          environment_key: default
+          job_cluster_key: pca_compute_cluster
           notebook_task:
             notebook_path: ../notebooks/01_compute_pca.py
             source: WORKSPACE
@@ -95,7 +99,8 @@ resources:
         - name: user_email
           default: ${var.current_user}
 
-      # Classic cluster used ONLY by the Glow ingest task. Everything else is serverless.
+      # Classic clusters: ingest (Glow) + compute_pca (driver-collect eigh / RDD distributed backend).
+      # save_results + mark_* stay serverless (environment_key: default) — they only read a table / log MLflow.
       job_clusters:
         - job_cluster_key: pca_ingest_cluster
           new_cluster:
@@ -109,6 +114,23 @@ resources:
             data_security_mode: SINGLE_USER
             runtime_engine: STANDARD
             num_workers: 2
+
+        - job_cluster_key: pca_compute_cluster      # single-node fit: driver-collect eigh + RDD/MLlib distributed backend
+          new_cluster:
+            spark_version: 15.4.x-scala2.12
+            node_type_id: ${var.cpu_node_type}
+            data_security_mode: SINGLE_USER          # SINGLE_USER (not shared) → RDD/MLlib available for backend=distributed
+            runtime_engine: STANDARD
+            num_workers: 0
+            spark_conf:
+              spark.databricks.cluster.profile: singleNode
+              spark.master: "local[*, 2]"
+              spark.driver.memory: "16g"             # room for the driver-collect eigh
+              spark.driver.maxResultSize: "8g"
+            custom_tags:
+              ResourceClass: SingleNode
+              work_type: pca_compute
+            enable_elastic_disk: true
 
       environments:
         - environment_key: default

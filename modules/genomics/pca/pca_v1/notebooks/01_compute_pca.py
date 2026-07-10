@@ -63,7 +63,11 @@ run = mlflow_run_id.replace("-", "_")
 dosage = spark.table(f"{catalog}.{schema}.pca_dosage_{run}")
 
 # canonical sample order (identical across all variant rows) → the fit's dose-column labels
-sample_ids = list(dosage.select("sample_ids").first()["sample_ids"])
+_first = dosage.select("sample_ids").first()
+if _first is None or not _first["sample_ids"]:
+    raise ValueError(f"pca_dosage_{run} is empty (0 biallelic SNPs / 0 samples) — check the cohort VCF "
+                     f"and 00_ingest_vcf's dosage_field.")
+sample_ids = list(_first["sample_ids"])
 N = len(sample_ids)
 
 freq = dosage.select(
@@ -72,18 +76,36 @@ freq = dosage.select(
     F.expr("size(filter(states, x -> x is not null))").alias("n_called"),
 ).withColumn("af", F.col("alt_sum") / (2 * F.col("n_called")))
 
-common = freq.where((F.col("n_called") > 0) & (F.least(F.col("af"), 1 - F.col("af")) >= F.lit(maf_cutoff)))
+# autosomes only (chrom 1–22) — match the reference path, and keep sex/MT variants out of the
+# covariance so a PC can't separate by sex instead of ancestry (undesirable as a GWAS covariate).
+common = freq.where(
+    (F.col("n_called") > 0)
+    & (F.least(F.col("af"), 1 - F.col("af")) >= F.lit(maf_cutoff))
+    & F.col("chrom").rlike("^[0-9]+$") & (F.col("chrom").cast("int").between(1, 22))
+)
 if max_variants and max_variants > 0:
-    common = common.limit(max_variants)
+    common = common.orderBy("chrom", "pos").limit(max_variants)   # deterministic cap (limit alone is arbitrary)
 
 # per-variant dose table matching lib/pca_fit's contract: dose = states with nulls → NaN (the fit's
 # missing convention); ref/alt are placeholders (unused for an in-cohort fit — no cross-strand
-# projection of out-of-sample members); vidx = a stable row id for the prune/collect join.
+# projection of out-of-sample members); vidx = the prune/collect join key.
 qc = (common
       .withColumn("vidx", F.monotonically_increasing_id())
       .withColumn("dose", F.expr("transform(states, x -> coalesce(cast(x as double), double('nan')))"))
       .withColumn("ref", F.lit("N")).withColumn("alt", F.lit("N"))
       .select("vidx", "chrom", "pos", "ref", "alt", "dose"))
+
+# MATERIALIZE to a temp table so vidx is STABLE across the two actions fit_pca_model runs (the prune's
+# applyInPandas and the dose collect). monotonically_increasing_id is non-deterministic across
+# re-evaluations, and .cache() can be evicted → recompute → different ids → dose paired with the wrong
+# locus. Persisting fixes the ids (mirrors the reference path's _pca_qc_dose table). Dropped after fit.
+_qc_tbl = f"_pca_cohort_qc_{run}"
+qc.write.mode("overwrite").option("overwriteSchema", "true").saveAsTable(_qc_tbl)
+qc = spark.table(_qc_tbl)
+n_qc = qc.count()
+if n_qc == 0:
+    raise ValueError(f"0 common autosomal biallelic SNPs after QC (maf_cutoff={maf_cutoff}) — nothing to fit.")
+print(f"QC variants (cohort, autosomal, MAF≥{maf_cutoff}): {n_qc:,}")
 
 # COMMAND ----------
 
@@ -105,4 +127,5 @@ pca_fit.fit_pca_model(
     panel_version=f"cohort_{run}", out_path=out_path,
     scores_table=scores_table, backend=backend,
 )
+spark.sql(f"DROP TABLE IF EXISTS {_qc_tbl}")     # transient stable-vidx store; scores live in the table + npz
 print(f"cohort PCA → model {out_path} + scores {scores_table}")

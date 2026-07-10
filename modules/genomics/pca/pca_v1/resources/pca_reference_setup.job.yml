@@ -2,6 +2,7 @@ resources:
   jobs:
     pca_reference_setup:
       name: pca_reference_setup
+      timeout_seconds: 28800            # 8h backstop for the one-time ~15GB panel download + basis build
 
       # ONE-TIME ancestry-reference builder (run on demand, not per compute). Stages the pgsc
       # HGDP+1kGP panel to the pca_reference volume, then builds the frozen, projectable FRAPOSA PCA
@@ -43,8 +44,6 @@ resources:
           default: ${var.core_schema_name}
         # panel staging (ref_00_download_panel) + where the builder reads it from
         - name: dest_volume_dir
-          default: ${var.pca_reference_dir}
-        - name: panel_dir
           default: ${var.pca_reference_dir}
         # PCA basis (ref_01_build_basis) — Spark-native, no plink2
         - name: out_path

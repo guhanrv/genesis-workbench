@@ -33,7 +33,10 @@ serves `prs` as a read-only Volume artifact.
 | `vcf_path` | — | cohort VCF |
 | `n_components` | 10 | number of PCs to emit |
 | `maf_cutoff` | 0.05 | minor-allele-frequency filter |
-| `max_variants` | 0 | optional SNP cap for runtime (0 = all; variant count is unbounded with this orientation) |
+| `max_variants` | 0 | optional SNP cap for runtime (0 = all; applied deterministically after an order-by) |
+| `r2` | 0.05 | LD-prune r² threshold (prune a variant with r² ≥ this to a kept one in-window) |
+| `window_bp` | 1000000 | LD-prune window (bp) |
+| `backend` | `driver` | fit backend: `driver` (collect + `eigh`) or `distributed` (samples² Gram via RowMatrix; large cohorts) |
 
 ## Deploy
 
@@ -49,12 +52,16 @@ Requires `core` (catalog/schema, the `libraries` volume with the Glow JAR + whee
 - Two flows, one engine: in-cohort (`pca_compute`) and reference (`pca_reference_setup`)
   both call `lib/pca_fit`. Projecting members onto the reference basis + ancestry
   classification lives in `prs` (it's PRS-domain); `gwas` consumes the in-cohort scores.
-- `lib/pca_fit` collects the pruned matrix to the driver for the `eigh` (required to emit
-  projectable variant loadings, which `spark.ml.PCA` can't in this orientation). The
-  covariance is `N×N` (samples²), so this is cohort/reference scale — fine on the reference
-  cluster and on serverless for modest cohorts. A very large in-cohort GWAS PCA should run
-  on a classic driver like the reference job, or move to a distributed-Gram backend (a
-  tracked follow-up). LD-prune is now built in (`r2`/`window_bp`).
+- **Both entry points run on classic single-node clusters** (not serverless): the `driver` backend
+  collects the pruned matrix to the driver for the `eigh` (needed to emit projectable variant
+  loadings, which `spark.ml.PCA` can't in this orientation), and the `distributed` backend uses the
+  RDD/MLlib API — neither works on serverless. Only `pca_compute`'s `save_results`/`mark_*` stay
+  serverless (they just read a table / log MLflow).
+- Two backends, one output contract: `driver` (default) for cohort/reference scale; `distributed`
+  (`backend=distributed`) computes the samples² Gram via `RowMatrix` + loadings via a distributed map,
+  never collecting the full variant × sample matrix — for large in-cohort GWAS PCA. The samples² Gram
+  itself must still fit the driver (~tens of thousands of samples — the intrinsic limit of a samples²
+  PCA). LD-prune is built in (`r2`/`window_bp`); QC is autosomal-only.
 - The mean-impute + PCA method has a dependency-light reference + unit test in
   `tests/test_pca_reference.py` (numpy only): it confirms PC1 separates a synthetic
   two-population cohort. The Spark notebook itself runs only on a cluster.
