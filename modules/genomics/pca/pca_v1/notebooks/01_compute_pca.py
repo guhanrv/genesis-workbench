@@ -99,11 +99,12 @@ qc = (common
 # applyInPandas and the dose collect). monotonically_increasing_id is non-deterministic across
 # re-evaluations, and .cache() can be evicted → recompute → different ids → dose paired with the wrong
 # locus. Persisting fixes the ids (mirrors the reference path's _pca_qc_dose table). Dropped after fit.
-_qc_tbl = f"_pca_cohort_qc_{run}"
-qc.write.mode("overwrite").option("overwriteSchema", "true").saveAsTable(_qc_tbl)
+_qc_tbl = f"{catalog}.{schema}._pca_cohort_qc_{run}"   # FULLY qualified (no USE CATALOG/SCHEMA here) — must
+qc.write.mode("overwrite").option("overwriteSchema", "true").saveAsTable(_qc_tbl)   # land in the module schema
 qc = spark.table(_qc_tbl)
 n_qc = qc.count()
 if n_qc == 0:
+    spark.sql(f"DROP TABLE IF EXISTS {_qc_tbl}")
     raise ValueError(f"0 common autosomal biallelic SNPs after QC (maf_cutoff={maf_cutoff}) — nothing to fit.")
 print(f"QC variants (cohort, autosomal, MAF≥{maf_cutoff}): {n_qc:,}")
 
@@ -120,12 +121,14 @@ print(f"QC variants (cohort, autosomal, MAF≥{maf_cutoff}): {n_qc:,}")
 
 out_path = f"{model_dir.rstrip('/')}/pca_model_{run}.npz"
 scores_table = f"{catalog}.{schema}.pca_components_{run}"
-pca_fit.fit_pca_model(
-    spark, qc,
-    sample_ids=sample_ids, superpops=np.array([]),      # in-cohort: unlabeled (no reference superpops)
-    dim_ref=min(n_components, N), r2=r2, window_bp=window_bp,
-    panel_version=f"cohort_{run}", out_path=out_path,
-    scores_table=scores_table, backend=backend,
-)
-spark.sql(f"DROP TABLE IF EXISTS {_qc_tbl}")     # transient stable-vidx store; scores live in the table + npz
+try:
+    pca_fit.fit_pca_model(
+        spark, qc,
+        sample_ids=sample_ids, superpops=np.array([]),      # in-cohort: unlabeled (no reference superpops)
+        dim_ref=min(n_components, N), r2=r2, window_bp=window_bp,
+        panel_version=f"cohort_{run}", out_path=out_path,
+        scores_table=scores_table, backend=backend,
+    )
+finally:
+    spark.sql(f"DROP TABLE IF EXISTS {_qc_tbl}")   # transient stable-vidx store — cleaned up even on failure
 print(f"cohort PCA → model {out_path} + scores {scores_table}")

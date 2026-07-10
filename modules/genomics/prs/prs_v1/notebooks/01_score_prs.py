@@ -39,9 +39,11 @@ planned_pgs = plan.select("pgs_id", "weight_sha").distinct()
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ### 1. Raw score — join only the planned samples' dosage to the planned PGS' weights
-# MAGIC Restricting both sides to the plan keeps add-sample (one row) / add-PGS (one column) tiny; a semi-join
-# MAGIC back to the plan drops any (sample,pgs) product not actually requested.
+# MAGIC ### 1. Raw score — join the planned samples' dosage to the planned PGS' weights
+# MAGIC `dose` is pruned to the plan's samples and `wts` to the plan's PGS, so the aggregate spans that
+# MAGIC grid; the FINAL left-join onto the plan (below) keeps exactly the planned cells and fills any
+# MAGIC zero-coverage ones (raw=0) so each planned cell is written once. For single-mode plans (add-sample
+# MAGIC / add-PGS / restate-one) the grid IS the plan, so nothing extra is aggregated.
 
 # COMMAND ----------
 

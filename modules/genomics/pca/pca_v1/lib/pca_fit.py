@@ -75,7 +75,10 @@ def fit_pca_model(
     """
     n_panel = len(sample_ids)
     dim_stu = dim_ref * 2
-    dim_online = min(dim_stu * 2, n_panel)   # clamp: eigh yields only n_panel eigenvectors (tiny cohorts)
+    # clamp: eigh yields n_panel eigenvectors, and per-variant mean-centering makes the all-ones
+    # sample vector an exact null eigenvector (one ~0 eigenvalue) — cap at n_panel-1 so U=X·(V/s)
+    # never divides by that ~0 (which would seed inf/nan into a trailing loading column on tiny cohorts).
+    dim_online = min(dim_stu * 2, max(1, n_panel - 1))
 
     # --- 1. Distributed LD prune (per chrom × chunk; Hail-style windowed greedy r²) ---
     PRUNE_SCHEMA = StructType([

@@ -59,9 +59,12 @@ Requires `core` (catalog/schema, the `libraries` volume with the Glow JAR + whee
   serverless (they just read a table / log MLflow).
 - Two backends, one output contract: `driver` (default) for cohort/reference scale; `distributed`
   (`backend=distributed`) computes the samples² Gram via `RowMatrix` + loadings via a distributed map,
-  never collecting the full variant × sample matrix — for large in-cohort GWAS PCA. The samples² Gram
-  itself must still fit the driver (~tens of thousands of samples — the intrinsic limit of a samples²
-  PCA). LD-prune is built in (`r2`/`window_bp`); QC is autosomal-only.
+  never collecting the full variant × sample matrix — its win over `driver` is relieving the
+  *variant*-axis driver-memory ceiling for large in-cohort GWAS PCA. The samples² Gram itself must
+  still fit the driver (~tens of thousands of samples — the intrinsic limit of a samples² PCA). The
+  `pca_compute_cluster` is single-node (`num_workers: 0`) by default — `distributed` already helps
+  there; **titrate `num_workers` up for horizontal shuffle/compute scale**. LD-prune is built in
+  (`r2`/`window_bp`); QC is autosomal-only.
 - The mean-impute + PCA method has a dependency-light reference + unit test in
   `tests/test_pca_reference.py` (numpy only): it confirms PC1 separates a synthetic
   two-population cohort. The Spark notebook itself runs only on a cluster.

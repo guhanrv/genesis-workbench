@@ -57,11 +57,16 @@ registry = spark.table("pgs_registry").select("pgs_id", "weight_sha")
 if pgs_filter:
     registry = registry.where(F.col("pgs_id").isin(pgs_filter))
 
-# panel_version to normalize against: explicit param, else the latest present per pgs
+# panel_version to normalize against: explicit param, else the version curated for the CURRENTLY-
+# registered weights — join pgs_panel_ref on (pgs_id, weight_sha), NOT a lexicographic max over all
+# historical versions (string max mis-picks across digit boundaries, e.g. 'v10' < 'v2'). max() here
+# only tiebreaks the rare case where the same weights were re-curated under several versions.
 if panel_version:
     pv = F.lit(panel_version)
 else:
-    pv_tbl = spark.table("pgs_panel_ref").groupBy("pgs_id").agg(F.max("panel_version").alias("panel_version"))
+    pv_tbl = (spark.table("pgs_panel_ref").select("pgs_id", "weight_sha", "panel_version").distinct()
+              .join(registry, ["pgs_id", "weight_sha"])
+              .groupBy("pgs_id").agg(F.max("panel_version").alias("panel_version")))
     registry = registry.join(pv_tbl, "pgs_id", "left")
 
 samples = spark.table("dosage").select("sample_id").distinct()

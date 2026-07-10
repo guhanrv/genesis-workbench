@@ -74,9 +74,10 @@ pv_key = (pd.Categorical(chrom_np, categories=_cats).codes.astype(np.int64) << 4
 uni_key = ((pd.Categorical(uni_pd["chrom"].astype(str), categories=_cats).codes.astype(np.int64) << 40)
            | uni_pd["pos"].astype(np.int64).to_numpy())
 gidx = np.nonzero(np.isin(pv_key, uni_key))[0]
+# take REF/ALT only for matched rows (Arrow take), not a full-column object-array materialization
 pvsub = pd.DataFrame({"gidx": gidx, "chrom": chrom_np[gidx], "pos": pos_np[gidx],
-                      "ref": pv["REF"].to_numpy(zero_copy_only=False)[gidx],
-                      "alt": pv["ALT"].to_numpy(zero_copy_only=False)[gidx]})
+                      "ref": pc.take(pv["REF"], gidx).to_numpy(zero_copy_only=False),
+                      "alt": pc.take(pv["ALT"], gidx).to_numpy(zero_copy_only=False)})
 print(f"pvar rows at union positions: {len(pvsub):,}")
 
 # match union (effect,other) to pvar (ref,alt); record whether effect == ALT (else effect == REF)
