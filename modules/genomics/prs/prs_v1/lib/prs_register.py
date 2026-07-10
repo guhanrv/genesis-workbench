@@ -11,11 +11,13 @@ Design notes
   scorer (``raw = Σ dose·weight``): ``variant_id = chrom:pos:effect:other`` and a
   plain ``weight``. Rows at the same ``variant_id`` within one PGS are summed
   (a scorefile can list a variant twice).
-* **Panel reference is a curation READ, not a compute.** ``prs.yaml`` already
-  carries ``reference_distribution`` — function_prs's FROZEN HGDP+1kGP per-superpop
-  mean/sd — so ``pgs_panel_ref`` is populated from it directly ($0). The
-  ``panel_version`` is the curation's ``version``. (A compute-from-1000G builder
-  can replace ``panel_ref_rows`` later behind this same seam.)
+* **Panel reference: computed OR curated.** By default ``06_build_panel_ref`` COMPUTES
+  ``pgs_panel_ref`` (per-PGS × superpop mean/sd) by scoring the reference panel per PGS —
+  self-contained, scales to 100+ PGS, no offline plink2. As an OVERRIDE, put frozen stats
+  in ``prs.yaml``'s ``reference_distribution`` and ``panel_ref_rows`` (below) writes them
+  directly ($0) — same ``pgs_panel_ref`` table, same ``(pgs_id, superpop, panel_version)``
+  key, so the two paths are interchangeable behind this seam. ``panel_version`` is the
+  curation's ``version`` (both paths must stamp the same one for the scorer's z-join).
 * **weight_sha** is the sha256 of the raw scorefile bytes — the content address
   that scopes a single-PGS restatement to its own column (registry/weights/panel_ref
   for one PGS all share it; the other 100 stay valid).
