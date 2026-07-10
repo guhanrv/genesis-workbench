@@ -184,10 +184,12 @@ import sys
 sys.path.append(os.path.abspath(os.path.join(os.getcwd(), "..", "lib")))
 import pca_fit
 
-pca_fit.fit_pca_model(
-    spark, qc,
-    sample_ids=unrel_iids, superpops=superpops,
-    dim_ref=dim_ref, r2=R2, window_bp=WINDOW_BP,
-    panel_version=panel_version, out_path=out_path,
-)
-spark.sql("DROP TABLE IF EXISTS _pca_qc_dose")
+try:
+    pca_fit.fit_pca_model(
+        spark, qc,
+        sample_ids=unrel_iids, superpops=superpops,
+        dim_ref=dim_ref, r2=R2, window_bp=WINDOW_BP,
+        panel_version=panel_version, out_path=out_path,
+    )
+finally:
+    spark.sql("DROP TABLE IF EXISTS _pca_qc_dose")   # transient QC store — cleaned up even on fit failure

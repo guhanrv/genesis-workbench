@@ -207,6 +207,8 @@ if pca_scores_table:
     tbl = pca_scores_table if "." in pca_scores_table else f"{catalog}.{schema}.{pca_scores_table}"
     cov = spark.table(tbl).toPandas().set_index("sample_id")
     cov.index = cov.index.astype(str)
+    if cov.index.duplicated().any():
+        raise ValueError(f"{tbl} has duplicate sample_id rows — expected one PC row per sample.")
     cov = cov[[c for c in cov.columns if c.startswith("PC")]]
     if cov.shape[1] < 1:
         raise ValueError(f"{tbl} has no PC* columns — not a pca_v1 pca_components table? "

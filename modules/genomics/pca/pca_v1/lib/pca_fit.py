@@ -74,10 +74,13 @@ def fit_pca_model(
         (~tens of thousands of samples), which is the intrinsic limit of a samples² PCA.
     """
     n_panel = len(sample_ids)
+    # clamp to rank: eigh yields n_panel eigenvectors, and per-variant mean-centering makes the all-ones
+    # sample vector an exact null eigenvector (one ~0 eigenvalue) → usable rank ≤ n_panel-1. Capping both
+    # dim_ref and dim_online at n_panel-1 keeps dim_ref ≤ dim_online and stops U=X·(V/s) from dividing by
+    # that ~0 (which would seed inf/nan into a trailing loading column on tiny cohorts). No-op when
+    # n_panel ≫ dims (real cohorts / the reference panel).
+    dim_ref = min(dim_ref, max(1, n_panel - 1))
     dim_stu = dim_ref * 2
-    # clamp: eigh yields n_panel eigenvectors, and per-variant mean-centering makes the all-ones
-    # sample vector an exact null eigenvector (one ~0 eigenvalue) — cap at n_panel-1 so U=X·(V/s)
-    # never divides by that ~0 (which would seed inf/nan into a trailing loading column on tiny cohorts).
     dim_online = min(dim_stu * 2, max(1, n_panel - 1))
 
     # --- 1. Distributed LD prune (per chrom × chunk; Hail-style windowed greedy r²) ---

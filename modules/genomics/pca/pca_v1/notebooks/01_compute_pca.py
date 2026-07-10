@@ -101,11 +101,14 @@ qc = (common
 # locus. Persisting fixes the ids (mirrors the reference path's _pca_qc_dose table). Dropped after fit.
 _qc_tbl = f"{catalog}.{schema}._pca_cohort_qc_{run}"   # FULLY qualified (no USE CATALOG/SCHEMA here) — must
 qc.write.mode("overwrite").option("overwriteSchema", "true").saveAsTable(_qc_tbl)   # land in the module schema
-qc = spark.table(_qc_tbl)
-n_qc = qc.count()
-if n_qc == 0:
-    spark.sql(f"DROP TABLE IF EXISTS {_qc_tbl}")
-    raise ValueError(f"0 common autosomal biallelic SNPs after QC (maf_cutoff={maf_cutoff}) — nothing to fit.")
+try:
+    qc = spark.table(_qc_tbl)
+    n_qc = qc.count()
+    if n_qc == 0:
+        raise ValueError(f"0 common autosomal biallelic SNPs after QC (maf_cutoff={maf_cutoff}) — nothing to fit.")
+except Exception:
+    spark.sql(f"DROP TABLE IF EXISTS {_qc_tbl}")   # no leak if the count / guard fails before the fit cell
+    raise
 print(f"QC variants (cohort, autosomal, MAF≥{maf_cutoff}): {n_qc:,}")
 
 # COMMAND ----------
