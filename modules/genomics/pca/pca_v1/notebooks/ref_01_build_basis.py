@@ -53,6 +53,7 @@ dbutils.widgets.text("panel_version", "pgsc_HGDP+1kGP_v2_nohwe", "Basis provenan
 import os
 import numpy as np
 import pandas as pd
+import pyarrow.parquet as pq
 import pyspark.sql.functions as F
 from pyspark.sql.types import (StructType, StructField, StringType, LongType, IntegerType,
                                FloatType, ArrayType)
@@ -91,18 +92,25 @@ n_panel = len(unrel_iids); n_all = len(all_iids)
 uniq, cnts = np.unique(superpops, return_counts=True)
 print(f"panel: {n_all} total, {n_panel} unrelated | { {k: int(v) for k, v in zip(uniq, cnts)} }")
 
-# pgen variant table (pgen order) — CHROM already 'chr'-stripped in the parquet.
-pvar = spark.read.parquet(pvar_parquet).toPandas()
-pvar["vidx"] = np.arange(len(pvar), dtype=np.int64)
-n_pgen = len(pvar)
+# pgen variant table (pgen order) — CHROM already 'chr'-stripped in the parquet. Read as ARROW
+# (columnar), NOT pandas: at ~10^8 panel variants, pandas `.astype(str).to_numpy()` on chrom/ref/alt
+# materializes ~15 GB of Python allele strings on the driver, which is what forced driver.memory down
+# and the QC concurrency to local[*,2]. Arrow keeps them as packed bytes+offsets (~hundreds of MB/col)
+# and preserves the FULL allele strings, so indels / single-char non-ACGT (e.g. 'N') filter EXACTLY as
+# the string path did — byte-identical. Mirrors prs ref_00_build_panel_stats (Arrow, strings, no int codes).
+pv_tbl = pq.read_table(pvar_parquet, columns=["CHROM", "POS", "REF", "ALT"])
+n_pgen = pv_tbl.num_rows
 print(f"pgen variants: {n_pgen}")
 
 PGEN_B = spark.sparkContext.broadcast(panel_pgen)
 UNREL_B = spark.sparkContext.broadcast(unrel_pos)
-# broadcast pgen-ordered chrom/pos/ref/alt for the QC-read tasks
+# pos → int64 numpy (small); chrom/ref/alt → contiguous Arrow arrays (compact, full strings), sliced
+# per block in the QC read. Broadcast is ~2 GB (vs ~15 GB of Python-object arrays before).
 PV_B = spark.sparkContext.broadcast({
-    "chrom": pvar["CHROM"].astype(str).to_numpy(), "pos": pvar["POS"].to_numpy(np.int64),
-    "ref": pvar["REF"].astype(str).to_numpy(), "alt": pvar["ALT"].astype(str).to_numpy()})
+    "chrom": pv_tbl["CHROM"].combine_chunks(),
+    "pos": pv_tbl["POS"].to_numpy(zero_copy_only=False).astype(np.int64),
+    "ref": pv_tbl["REF"].combine_chunks(),
+    "alt": pv_tbl["ALT"].combine_chunks()})
 
 # COMMAND ----------
 
@@ -129,7 +137,7 @@ QC_SCHEMA = StructType([
 def _qc_block(itr):
     import numpy as _np
     from pgenlib import PgenReader
-    pv = PV_B.value; unrel = UNREL_B.value; n_all_ = None
+    pv = PV_B.value; unrel = UNREL_B.value
     rd = PgenReader(PGEN_B.value.encode())
     n_all_ = rd.get_raw_sample_ct()
     try:
@@ -140,11 +148,15 @@ def _qc_block(itr):
                 rd.read_dosages_range(start, stop, buf, sample_maj=0)
                 buf = buf[:, unrel]                     # subset to unrelated samples
                 buf[buf < -0.5] = _np.nan
+                # slice this block's metadata once (Arrow → py lists), not a per-variant scalar deref
+                chrom_b = pv["chrom"].slice(start, stop - start).to_pylist()
+                ref_b = pv["ref"].slice(start, stop - start).to_pylist()
+                alt_b = pv["alt"].slice(start, stop - start).to_pylist()
+                pos_b = pv["pos"][start:stop]
                 out = []
                 for k in range(stop - start):
-                    gi = start + k
-                    c = str(pv["chrom"][gi]); r = str(pv["ref"][gi]); a = str(pv["alt"][gi])
-                    if not c.isdigit() or int(c) < 1 or int(c) > 22:      # autosome
+                    c = chrom_b[k]; r = ref_b[k]; a = alt_b[k]
+                    if not c or not c.isdigit() or int(c) < 1 or int(c) > 22:  # autosome
                         continue
                     if len(r) != 1 or len(a) != 1:                        # biallelic SNV
                         continue
@@ -157,7 +169,7 @@ def _qc_block(itr):
                     af = float(d[valid].sum()) / (2.0 * nv)
                     if min(af, 1 - af) < MAF:                             # MAF
                         continue
-                    out.append((gi, c, int(pv["pos"][gi]), r, a, [float(x) for x in d]))
+                    out.append((start + k, c, int(pos_b[k]), r, a, [float(x) for x in d]))
                 if out:
                     yield pd.DataFrame(out, columns=["vidx", "chrom", "pos", "ref", "alt", "dose"])
     finally:
