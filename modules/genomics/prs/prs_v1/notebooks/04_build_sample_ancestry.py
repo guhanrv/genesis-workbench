@@ -12,7 +12,7 @@
 # MAGIC     pgsc_calc's reference), NOT
 # MAGIC     recomputed per run;
 # MAGIC   - the **heavy per-sample work is distributed**: gVCF dose extraction at the basis loci (chrom-sharded,
-# MAGIC     the same kernel as `00_extract_dosage`) + the OADP projection (`applyInPandas`, **numpy-only** on
+# MAGIC     the same kernel as `02_extract_dosage`) + the OADP projection (`applyInPandas`, **numpy-only** on
 # MAGIC     executors — `project_member` pulls in no sklearn), so it scales across samples;
 # MAGIC   - the RF classify is O(n_samples × 5 PCs) — trained once and run on the **driver** over the collected
 # MAGIC     per-sample PCs (keeps sklearn/scipy off the executors; trivial even at biobank scale).
@@ -125,7 +125,7 @@ rows = [(str(chrom[i]), int(pos[i]), str(alt[i]), str(ref[i])) for i in range(n_
 ucat = ext.build_union_catalog(rows)
 basis_vids = [f"{chrom[i]}:{pos[i]}:{alt[i]}:{ref[i]}" for i in range(n_loci)]
 
-# FASTA ref-base per locus (once on the driver; content-addressed cache — same pattern as 00_extract_dosage)
+# FASTA ref-base per locus (once on the driver; content-addressed cache — same pattern as 02_extract_dosage)
 cache_path = None; _vol_cache = None
 if fasta_ref_cache_dir:
     key = hashlib.sha256((os.path.basename(basis_path) + "|" + os.path.basename(fasta_path)).encode()).hexdigest()[:16]

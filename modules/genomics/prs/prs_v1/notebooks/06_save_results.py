@@ -3,9 +3,9 @@
 # MAGIC # Publish PRS results + log summary metrics to MLflow
 # MAGIC
 # MAGIC Terminal step of the scoring DAG. Reads the fixed `prs_scores` cell-store (written by
-# MAGIC `01_score_prs`) and logs summary metrics on the MLflow run — coverage, how many cells carry a
+# MAGIC `05_score_prs`) and logs summary metrics on the MLflow run — coverage, how many cells carry a
 # MAGIC reference-panel `z_msp` / admixed `z_admixed`, and the raw-score distribution. Mirrors
-# MAGIC `pca_v1/02_save_results`. NOTE: because scoring is incremental (MERGE-upserted), these are
+# MAGIC `pca_v1/06_save_results`. NOTE: because scoring is incremental (MERGE-upserted), these are
 # MAGIC **store-wide totals** over the whole `prs_scores` table (all runs to date), NOT just the cells
 # MAGIC this run computed — the metric keys are `store_*` to make that explicit. (Per-run wide result
 # MAGIC tables are gone — results live in `prs_scores`.)

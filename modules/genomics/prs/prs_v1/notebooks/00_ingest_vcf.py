@@ -8,7 +8,7 @@
 # MAGIC the SAME long `dosage(sample_id, variant_id, dose)` store the gVCF path writes — so scoring downstream
 # MAGIC is identical regardless of ingest engine.
 # MAGIC
-# MAGIC **gVCF cohorts use `00_extract_dosage` instead** (the pysam END-block + FASTA kernel): Glow and plink2
+# MAGIC **gVCF cohorts use `02_extract_dosage` instead** (the pysam END-block + FASTA kernel): Glow and plink2
 # MAGIC both DROP gVCF `END=` REF blocks (~70% coverage loss), so a gVCF cannot go through this Glow path. This
 # MAGIC notebook guards against that (`allow_gvcf=false` → errors if `END` INFO is present).
 # MAGIC
@@ -22,7 +22,7 @@ dbutils.widgets.text("schema", "genesis_schema", "Schema")
 dbutils.widgets.text("vcf_path", "", "VCF to ingest (hard-called or imputed; multi-sample cohort ok)")
 dbutils.widgets.text("dosage_field", "auto", "Dosage source: auto | DS | HDS | GT")
 dbutils.widgets.text("pgs_ids", "", "Restrict to these PGS' variants (comma-sep; empty = all registered)")
-dbutils.widgets.text("allow_gvcf", "false", "true = don't error on END= gVCF (NOT recommended — use 00_extract_dosage)")
+dbutils.widgets.text("allow_gvcf", "false", "true = don't error on END= gVCF (NOT recommended — use 02_extract_dosage)")
 
 catalog = dbutils.widgets.get("catalog")
 schema = dbutils.widgets.get("schema")
@@ -70,7 +70,7 @@ variants = spark.read.format("vcf").load(vcf_path).where(F.size("alternateAllele
 if not allow_gvcf and any(c.lower() == "info_end" for c in variants.columns):
     raise ValueError(
         "This looks like a gVCF (INFO/END present) — Glow drops END= REF blocks (~70% coverage loss). "
-        "Use 00_extract_dosage.py (pysam END-block + FASTA kernel) for gVCFs, or set allow_gvcf=true to force."
+        "Use 02_extract_dosage.py (pysam END-block + FASTA kernel) for gVCFs, or set allow_gvcf=true to force."
     )
 
 gt_elem = variants.schema["genotypes"].dataType.elementType

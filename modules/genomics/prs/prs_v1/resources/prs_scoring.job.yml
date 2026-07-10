@@ -36,7 +36,7 @@ resources:
             - task_key: setup_stores
           job_cluster_key: prs_light_cluster
           notebook_task:
-            notebook_path: ../notebooks/00_register_catalog.py
+            notebook_path: ../notebooks/01_register_catalog.py
             source: WORKSPACE
 
         # 3 — per-sample gVCF -> dosage (pysam kernel; one Spark task per sample). Titrate
@@ -48,7 +48,7 @@ resources:
             - task_key: register
           job_cluster_key: prs_extract_cluster
           notebook_task:
-            notebook_path: ../notebooks/00_extract_dosage.py
+            notebook_path: ../notebooks/02_extract_dosage.py
             source: WORKSPACE
 
         # 4 — the incremental brain + cost kill-switch: emit ONLY missing/stale cells.
@@ -58,7 +58,7 @@ resources:
             - task_key: extract_dosage
           job_cluster_key: prs_light_cluster
           notebook_task:
-            notebook_path: ../notebooks/02_reconcile.py
+            notebook_path: ../notebooks/03_reconcile.py
             source: WORKSPACE
 
         # 4b — per-sample ancestry: OADP-project members onto the frozen PCA basis → RF MSP →
@@ -72,7 +72,7 @@ resources:
             - task_key: extract_dosage
           job_cluster_key: prs_extract_cluster
           notebook_task:
-            notebook_path: ../notebooks/05_build_sample_ancestry.py
+            notebook_path: ../notebooks/04_build_sample_ancestry.py
             source: WORKSPACE
 
         # 5 — SQL join-aggregate over the plan + panel-ref normalization + MERGE prs_scores.
@@ -84,7 +84,7 @@ resources:
             - task_key: build_sample_ancestry
           job_cluster_key: prs_score_cluster
           notebook_task:
-            notebook_path: ../notebooks/01_score_prs.py
+            notebook_path: ../notebooks/05_score_prs.py
             source: WORKSPACE
 
         # 6 — publish results + log cohort summary metrics to MLflow (mirrors pca/gwas save_results).
@@ -94,7 +94,7 @@ resources:
             - task_key: score_prs
           job_cluster_key: prs_light_cluster
           notebook_task:
-            notebook_path: ../notebooks/02_save_results.py
+            notebook_path: ../notebooks/06_save_results.py
             source: WORKSPACE
             base_parameters:
               mlflow_run_id: "{{job.parameters.mlflow_run_id}}"

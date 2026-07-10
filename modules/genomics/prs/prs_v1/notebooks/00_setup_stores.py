@@ -86,7 +86,7 @@ PARTITIONED BY (pgs_id)
 """)
 
 # 6. Ancestry — per-sample most-similar-population from the frozen PCA basis (pca_v1 builds the basis;
-#    05_build_sample_ancestry projects+classifies). The scorer left-joins this on sample_id to pick the panel superpop row
+#    04_build_sample_ancestry projects+classifies). The scorer left-joins this on sample_id to pick the panel superpop row
 #    for z_msp/percentile_msp; declared here so it always exists (empty ⇒ scorer degrades to null z).
 spark.sql("""
 CREATE TABLE IF NOT EXISTS sample_ancestry (

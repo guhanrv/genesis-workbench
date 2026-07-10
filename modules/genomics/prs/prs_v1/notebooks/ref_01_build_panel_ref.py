@@ -8,7 +8,7 @@
 # MAGIC an offline curation (no plink2, no hand-pasted stats), so z scales to 100+ PGS on-cluster.
 # MAGIC
 # MAGIC **Spark-native, no binaries** (pgenlib for the pgen dose; distributed scoring in Spark), mirroring
-# MAGIC `04_build_panel_afreq` / the PCA basis build. Panel scoring genome-wide is the one worker-scalable
+# MAGIC `ref_00_build_panel_afreq` / the PCA basis build. Panel scoring genome-wide is the one worker-scalable
 # MAGIC job here (panel × union is large) — TITRATE `num_workers` up for a faster one-time build.
 # MAGIC
 # MAGIC Pipeline: registered `pgs_weights` → union variants matched to the panel `.pvar` (effect-orientation)
@@ -17,7 +17,7 @@
 # MAGIC per-PGS score vector → group panel samples by SuperPop → `{mean, sd}` → MERGE `pgs_panel_ref`.
 # MAGIC Keyed on `(pgs_id, superpop, panel_version)` + `weight_sha`, so it restates one PGS safely.
 # MAGIC
-# MAGIC Requires a prior `00_register_catalog` run (reads `pgs_weights` / `pgs_registry`).
+# MAGIC Requires a prior `01_register_catalog` run (reads `pgs_weights` / `pgs_registry`).
 
 # COMMAND ----------
 
@@ -103,7 +103,7 @@ uni_pd = (wq.select("variant_id").distinct()
                   F.col("p")[2].alias("effect"), F.col("p")[3].alias("other"))).toPandas()
 
 # pvar (driver) → global pgen index (gidx) of each union position; vectorised integer-key membership
-# (no per-row Python string over the ~10^8-row pvar — same approach as 04_build_panel_afreq).
+# (no per-row Python string over the ~10^8-row pvar — same approach as ref_00_build_panel_afreq).
 pv = pq.read_table(pvar_parquet, columns=["CHROM", "POS", "REF", "ALT"])
 import pyarrow.compute as pc
 chrom_np = pv["CHROM"].to_numpy(zero_copy_only=False).astype(str)

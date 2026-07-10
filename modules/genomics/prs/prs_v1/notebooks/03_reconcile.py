@@ -136,7 +136,7 @@ if n_cells > max_cells and not confirm_large:
 
 # COMMAND ----------
 
-# Persist the runnable plan; the scorer (01_score_prs) reads THIS table, so it only ever
+# Persist the runnable plan; the scorer (05_score_prs) reads THIS table, so it only ever
 # touches the cells reconcile approved — never the full grid.
 plan.write.mode("overwrite").option("overwriteSchema", "true").saveAsTable("_prs_reconcile_plan")
 print(f"Wrote runnable plan: {catalog}.{schema}._prs_reconcile_plan ({n_cells} cells). Scorer will process only these.")

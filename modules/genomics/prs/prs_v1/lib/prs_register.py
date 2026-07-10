@@ -2,7 +2,7 @@
 catalog-side Delta stores — ``pgs_registry``, ``pgs_weights``, ``pgs_panel_ref``.
 
 Kept free of Spark/dbutils so it can be unit-tested at $0 off-cluster (the
-notebook ``00_register_catalog`` is a thin wrapper: read curation → call these →
+notebook ``01_register_catalog`` is a thin wrapper: read curation → call these →
 ``createDataFrame`` → MERGE).
 
 Design notes
@@ -11,7 +11,7 @@ Design notes
   scorer (``raw = Σ dose·weight``): ``variant_id = chrom:pos:effect:other`` and a
   plain ``weight``. Rows at the same ``variant_id`` within one PGS are summed
   (a scorefile can list a variant twice).
-* **Panel reference: computed OR curated.** By default ``06_build_panel_ref`` COMPUTES
+* **Panel reference: computed OR curated.** By default ``ref_01_build_panel_ref`` COMPUTES
   ``pgs_panel_ref`` (per-PGS × superpop mean/sd) by scoring the reference panel per PGS —
   self-contained, scales to 100+ PGS, no offline plink2. As an OVERRIDE, put frozen stats
   in ``prs.yaml``'s ``reference_distribution`` and ``panel_ref_rows`` (below) writes them
@@ -30,7 +30,7 @@ import hashlib
 
 # superpop key (as curated in prs.yaml reference_distribution) — stored verbatim as
 # pgs_panel_ref.superpop; the scorer joins it BY EQUALITY to the PCA module's
-# most_similar_pop (01_score_prs). Those are the HGDP+1kGP panel SuperPop CODES
+# most_similar_pop (05_score_prs). Those are the HGDP+1kGP panel SuperPop CODES
 # (from the .psam SuperPop column, carried through the PCA basis + RF classifier),
 # so the curated keys must be the same codes or the z-join silently misses.
 _PANEL_SUPERPOPS = ("AFR", "AMR", "CSA", "EAS", "EUR", "MID")

@@ -38,24 +38,24 @@ setup_stores → register → extract_dosage → reconcile ───────
 ```
 
 - **`00_setup_stores`** — idempotent DDL for the stores above.
-- **`00_register_catalog`** — curation (`prs.yaml` + scorefiles) → `pgs_registry` / `pgs_weights` / `pgs_panel_ref`. Palindromic (A/T, C/G) SNPs dropped (strand-ambiguous).
-- **`00_extract_dosage`** — per-sample **gVCF** → `dosage`, one Spark task per (sample × chrom). Uses the ported pysam **END-block + FASTA** kernel (`lib/gvcf_dose.py`): plink2 and Glow both drop gVCF `END=` REF blocks (~70% coverage loss), so this can't be Glow/SQL. Incremental: skips samples already extracted. *(Non-gVCF cohorts use the sibling engine `00_ingest_vcf` — Glow `DS/HDS/GT`, imputed-dosage or regular hard-called VCF — which orients + MERGEs into the SAME `dosage` store, so everything downstream is identical.)*
-- **`02_reconcile`** — the incremental brain + cost kill-switch. Anti-joins the desired `(sample × pgs)` grid vs `prs_scores` → emits **only missing/stale cells**. **Dry-run by default** (`apply=false`): prints the cell count + estimated cost and scores nothing; a plan larger than `max_cells` additionally needs `confirm_large=true`. A stray run can never fire the full grid.
-- **`05_build_sample_ancestry`** — OADP-projects each sample onto the frozen FRAPOSA PCA basis (`lib/prs_ancestry.py`) → RF most-similar-pop → `sample_ancestry`. Extraction distributed like `extract_dosage`; RF classify on the driver.
-- **`01_score_prs`** — SQL join-aggregate over the reconcile plan → `raw`, then reference-panel `z_msp` + RF-posterior-weighted `z_admixed` → MERGE `prs_scores`. Default `missing_mode=drop`; `mean_impute` uses `pgs_panel_afreq` (2·AF).
-- **`02_save_results`** — read `prs_scores` → log cohort summary metrics (coverage, z_msp/z_admixed counts, raw distribution) to the MLflow run. `mark_success` / `mark_failure` then set the run's `job_status` (framework convention).
+- **`01_register_catalog`** — curation (`prs.yaml` + scorefiles) → `pgs_registry` / `pgs_weights` / `pgs_panel_ref`. Palindromic (A/T, C/G) SNPs dropped (strand-ambiguous).
+- **`02_extract_dosage`** — per-sample **gVCF** → `dosage`, one Spark task per (sample × chrom). Uses the ported pysam **END-block + FASTA** kernel (`lib/gvcf_dose.py`): plink2 and Glow both drop gVCF `END=` REF blocks (~70% coverage loss), so this can't be Glow/SQL. Incremental: skips samples already extracted. *(Non-gVCF cohorts use the sibling engine `00_ingest_vcf` — Glow `DS/HDS/GT`, imputed-dosage or regular hard-called VCF — which orients + MERGEs into the SAME `dosage` store, so everything downstream is identical.)*
+- **`03_reconcile`** — the incremental brain + cost kill-switch. Anti-joins the desired `(sample × pgs)` grid vs `prs_scores` → emits **only missing/stale cells**. **Dry-run by default** (`apply=false`): prints the cell count + estimated cost and scores nothing; a plan larger than `max_cells` additionally needs `confirm_large=true`. A stray run can never fire the full grid.
+- **`04_build_sample_ancestry`** — OADP-projects each sample onto the frozen FRAPOSA PCA basis (`lib/prs_ancestry.py`) → RF most-similar-pop → `sample_ancestry`. Extraction distributed like `extract_dosage`; RF classify on the driver.
+- **`05_score_prs`** — SQL join-aggregate over the reconcile plan → `raw`, then reference-panel `z_msp` + RF-posterior-weighted `z_admixed` → MERGE `prs_scores`. Default `missing_mode=drop`; `mean_impute` uses `pgs_panel_afreq` (2·AF).
+- **`06_save_results`** — read `prs_scores` → log cohort summary metrics (coverage, z_msp/z_admixed counts, raw distribution) to the MLflow run. `mark_success` / `mark_failure` then set the run's `job_status` (framework convention).
 
 ## Two ingest engines (both write the shared `dosage` store)
 
 | cohort | engine | notebook |
 |---|---|---|
-| **gVCF** (`END=` REF blocks) | pysam END-block + FASTA kernel | `00_extract_dosage` (in the scoring DAG) |
+| **gVCF** (`END=` REF blocks) | pysam END-block + FASTA kernel | `02_extract_dosage` (in the scoring DAG) |
 | **imputed dosage / regular hard-called VCF** (`DS`/`HDS`/`GT`) | Glow, distributed | `00_ingest_vcf` (guards against gVCF input) |
 
 ## Companion jobs
 
-- **`prs_reference_setup`** — one-time scoring-reference builders (run on demand): `04_build_panel_afreq` → `pgs_panel_afreq` (panel allele frequencies for mean-imputing missing PGS variants), and `06_build_panel_ref` → `pgs_panel_ref` (**computes** per-PGS × superpop `{mean,sd}` by scoring the reference panel per PGS — Spark-native, so `z_msp`/`z_admixed` need no offline plink2 curation and scale to 100+ PGS; leave `prs.yaml`'s `reference_distribution` empty to use it, or populate it to override with frozen stats). Both read the HGDP+1kGP panel from the **pca** module's `pca_reference` volume (pca owns the ancestry reference). The frozen PCA basis itself (`pca_basis.npz`) is built by **`pca_v1`** (`ref_01_build_basis`, Spark-native: distributed QC + Hail-style windowed-r² LD-prune + FRAPOSA eigendecomposition) and consumed here as a read-only artifact — see `pca_v1`. Run `pca_reference_setup` before this. `00_download_pgs_scorefile` runs in `prs_initial_setup_job`.
-- **`prs_maintenance`** — scheduled (paused) `03_maintain_stores`: OPTIMIZE + VACUUM + ANALYZE so MERGE versioning doesn't balloon.
+- **`prs_reference_setup`** — one-time scoring-reference builders (run on demand): `ref_00_build_panel_afreq` → `pgs_panel_afreq` (panel allele frequencies for mean-imputing missing PGS variants), and `ref_01_build_panel_ref` → `pgs_panel_ref` (**computes** per-PGS × superpop `{mean,sd}` by scoring the reference panel per PGS — Spark-native, so `z_msp`/`z_admixed` need no offline plink2 curation and scale to 100+ PGS; leave `prs.yaml`'s `reference_distribution` empty to use it, or populate it to override with frozen stats). Both read the HGDP+1kGP panel from the **pca** module's `pca_reference` volume (pca owns the ancestry reference). The frozen PCA basis itself (`pca_basis.npz`) is built by **`pca_v1`** (`ref_01_build_basis`, Spark-native: distributed QC + Hail-style windowed-r² LD-prune + FRAPOSA eigendecomposition) and consumed here as a read-only artifact — see `pca_v1`. Run `pca_reference_setup` before this. `00_download_pgs_scorefile` runs in `prs_initial_setup_job`.
+- **`prs_maintenance`** — scheduled (paused) `maintain_stores`: OPTIMIZE + VACUUM + ANALYZE so MERGE versioning doesn't balloon.
 
 ## Key parameters (`prs_scoring`)
 

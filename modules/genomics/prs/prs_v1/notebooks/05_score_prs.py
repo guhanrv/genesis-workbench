@@ -2,7 +2,7 @@
 # MAGIC %md
 # MAGIC # PRS scorer — SQL join-aggregate over the reconcile plan (classic; NOT serverless yet)
 # MAGIC
-# MAGIC Reads `_prs_reconcile_plan` (written by `02_reconcile`) and scores **only those (sample, pgs) cells** —
+# MAGIC Reads `_prs_reconcile_plan` (written by `03_reconcile`) and scores **only those (sample, pgs) cells** —
 # MAGIC so a run can never touch the full grid. Default mechanism is a plain **SQL join-aggregate** (predictable,
 # MAGIC observable cost); `applyInPandas` is a benchmark-gated alternative, not used here.
 # MAGIC
@@ -136,7 +136,7 @@ scored = scored.withColumn("percentile_msp", _norm_cdf_pct(F.col("z_msp")))
 
 # ── z_admixed — continuous-ancestry (PRSmix-style) normalization ─────────────────────────────
 # Standardize raw against EACH panel superpop's distribution and weight by the RF ancestry
-# posterior (rf_probs, persisted by 05_build_sample_ancestry):  z_admixed = Σ_pop P_RF(pop)·z_pop.
+# posterior (rf_probs, persisted by 04_build_sample_ancestry):  z_admixed = Σ_pop P_RF(pop)·z_pop.
 # Uses the SAME PGS + the existing pgs_panel_ref (per-superpop mean/sd), so it needs no bespoke
 # per-ancestry PGS catalog. For a non-admixed sample (RF ~1.0 on its MSP) it collapses to z_msp;
 # for an admixed sample it blends the superpop references. Degenerate rows (sd=0 / prob=0) drop and

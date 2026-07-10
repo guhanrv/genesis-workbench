@@ -17,7 +17,7 @@ resources:
       # module now — see pca_v1/resources/pca_reference_setup.job.yml. These tasks READ that panel as a
       # read-only Volume artifact (${var.pca_reference_dir}); run pca_reference_setup first.
       #
-      # NOTE: both tasks read the registered `pgs_weights` — run 00_register_catalog (via the prs_scoring
+      # NOTE: both tasks read the registered `pgs_weights` — run 01_register_catalog (via the prs_scoring
       #       job) at least once before this. build_panel_ref is worker-scalable (panel × union is large)
       #       — TITRATE prs_ref_cluster.num_workers up for a faster one-time genome-wide build.
 
@@ -30,7 +30,7 @@ resources:
           max_retries: 0
           job_cluster_key: prs_ref_cluster
           notebook_task:
-            notebook_path: ../notebooks/04_build_panel_afreq.py
+            notebook_path: ../notebooks/ref_00_build_panel_afreq.py
             source: WORKSPACE
 
         - task_key: build_panel_ref                # compute per-PGS × superpop {mean,sd} → pgs_panel_ref
@@ -38,7 +38,7 @@ resources:
           timeout_seconds: 28800
           job_cluster_key: prs_ref_cluster
           notebook_task:
-            notebook_path: ../notebooks/06_build_panel_ref.py
+            notebook_path: ../notebooks/ref_01_build_panel_ref.py
             source: WORKSPACE
 
       parameters:

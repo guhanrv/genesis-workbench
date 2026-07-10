@@ -16,7 +16,7 @@ resources:
           max_retries: 0
           job_cluster_key: prs_maint_cluster
           notebook_task:
-            notebook_path: ../notebooks/03_maintain_stores.py
+            notebook_path: ../notebooks/maintain_stores.py
             source: WORKSPACE
 
       parameters:
