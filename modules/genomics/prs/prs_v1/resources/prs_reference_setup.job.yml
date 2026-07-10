@@ -2,43 +2,37 @@ resources:
   jobs:
     prs_reference_setup:
       name: prs_reference_setup
-      timeout_seconds: 21600            # 6h backstop for the one-time pgenlib afreq build
+      timeout_seconds: 28800            # 8h backstop for the one-time genome-wide panel scan
 
-      # ONE-TIME scoring-reference builders (run on demand, not per scoring run), Spark-native — NO
-      # plink2 (pgenlib reads the panel pgen). Two outputs off the registered PGS + the panel:
-      #   - build_panel_afreq → pgs_panel_afreq  (per-variant panel AF, for missing→2·AF mean-impute)
-      #   - build_panel_ref   → pgs_panel_ref    (per-PGS × superpop {mean,sd}: COMPUTE the reference
-      #     distribution by scoring the panel per PGS, so z_msp/z_admixed need no offline plink2
-      #     curation and scale to 100+ PGS). Leave prs.yaml reference_distribution EMPTY to use this
-      #     computed path; populate it only to OVERRIDE with externally-frozen stats (register writes
-      #     those). panel_version MUST match the curation version the scorer normalizes against.
+      # ONE-TIME scoring-reference builder (run on demand, not per scoring run), Spark-native — NO plink2
+      # (pgenlib reads the panel pgen). A SINGLE panel scan at the registered PGS-union loci produces BOTH:
+      #   - pgs_panel_afreq  (per-variant panel effect-AF, for missing→2·AF mean-impute) — a byproduct of
+      #   - pgs_panel_ref    (per-PGS × superpop {mean,sd,quantiles}: COMPUTE the reference distribution by
+      #     scoring the panel per PGS, so z_msp/z_admixed need no offline plink2 curation and scale to
+      #     100+ PGS). Leave prs.yaml reference_distribution EMPTY to use this computed path; populate it
+      #     only to OVERRIDE with externally-frozen stats (register writes those). panel_version MUST
+      #     match the curation version the scorer normalizes against.
       #
       # The ANCESTRY reference (HGDP+1kGP panel staging + the frozen PCA basis) is owned by the pca
-      # module now — see pca_v1/resources/pca_reference_setup.job.yml. These tasks READ that panel as a
+      # module now — see pca_v1/resources/pca_reference_setup.job.yml. This task READS that panel as a
       # read-only Volume artifact (${var.pca_reference_dir}); run pca_reference_setup first.
       #
-      # NOTE: both tasks read the registered `pgs_weights` — run 01_register_catalog (via the prs_scoring
-      #       job) at least once before this. build_panel_ref is worker-scalable (panel × union is large)
-      #       — TITRATE prs_ref_cluster.num_workers up for a faster one-time genome-wide build.
+      # NOTE: reads the registered `pgs_weights` — run 01_register_catalog (via the prs_scoring job) at
+      #       least once before this. The panel scoring is worker-scalable (panel × union is large) —
+      #       TITRATE prs_ref_cluster.num_workers up for a faster one-time genome-wide build. The
+      #       union↔pgen match is driver-bounded per chromosome, so a genome-wide union won't OOM.
 
       email_notifications:
         on_failure:
           - ${var.current_user}
 
       tasks:
-        - task_key: build_panel_afreq
-          max_retries: 0
-          job_cluster_key: prs_ref_cluster
-          notebook_task:
-            notebook_path: ../notebooks/ref_00_build_panel_afreq.py
-            source: WORKSPACE
-
-        - task_key: build_panel_ref                # compute per-PGS × superpop {mean,sd} → pgs_panel_ref
+        - task_key: build_panel_stats              # ONE scan → pgs_panel_afreq + pgs_panel_ref (+quantiles)
           max_retries: 0
           timeout_seconds: 28800
           job_cluster_key: prs_ref_cluster
           notebook_task:
-            notebook_path: ../notebooks/ref_01_build_panel_ref.py
+            notebook_path: ../notebooks/ref_00_build_panel_stats.py
             source: WORKSPACE
 
       parameters:

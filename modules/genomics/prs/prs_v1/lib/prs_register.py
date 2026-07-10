@@ -11,8 +11,8 @@ Design notes
   scorer (``raw = Σ dose·weight``): ``variant_id = chrom:pos:effect:other`` and a
   plain ``weight``. Rows at the same ``variant_id`` within one PGS are summed
   (a scorefile can list a variant twice).
-* **Panel reference: computed OR curated.** By default ``ref_01_build_panel_ref`` COMPUTES
-  ``pgs_panel_ref`` (per-PGS × superpop mean/sd) by scoring the reference panel per PGS —
+* **Panel reference: computed OR curated.** By default ``ref_00_build_panel_stats`` COMPUTES
+  ``pgs_panel_ref`` (per-PGS × superpop mean/sd/quantiles) by scoring the reference panel per PGS —
   self-contained, scales to 100+ PGS, no offline plink2. As an OVERRIDE, put frozen stats
   in ``prs.yaml``'s ``reference_distribution`` and ``panel_ref_rows`` (below) writes them
   directly ($0) — same ``pgs_panel_ref`` table, same ``(pgs_id, superpop, panel_version)``

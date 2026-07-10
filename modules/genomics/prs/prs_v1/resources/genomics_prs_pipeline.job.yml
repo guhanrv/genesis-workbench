@@ -11,9 +11,10 @@ resources:
       #   1. pca_reference_setup  (pca_v1 bundle)  → stage panel + build pca_basis.npz   [cross-bundle]
       #   2. prs_scoring          (this bundle)    → register → extract → classify (reads the basis)
       #                                              → reconcile → score(drop) → save
-      #   3. prs_reference_setup  (this bundle)    → build pgs_panel_afreq (needs the panel from step 1
-      #                                              AND the pgs_weights registered in step 2) — enables
-      #                                              the optional mean_impute scoring mode on FUTURE runs
+      #   3. prs_reference_setup  (this bundle)    → build pgs_panel_afreq + pgs_panel_ref in ONE panel
+      #                                              scan (needs the panel from step 1 AND the pgs_weights
+      #                                              registered in step 2) — enables mean_impute + z on
+      #                                              FUTURE runs
       #
       # This is the ONE-TIME bootstrap / full first-run for a fresh workspace. Step 1 rebuilds the
       # basis (~expensive, single-node), so in STEADY STATE do NOT run this — run `prs_scoring`
@@ -35,7 +36,7 @@ resources:
           run_job_task:
             job_id: ${resources.jobs.prs_scoring.id}
 
-        - task_key: build_panel_afreq            # same bundle; needs panel (step 1) + weights (step 2)
+        - task_key: build_panel_stats            # same bundle; needs panel (step 1) + weights (step 2)
           depends_on:
             - task_key: score_prs
           run_job_task:

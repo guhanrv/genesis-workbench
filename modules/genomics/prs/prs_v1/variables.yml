@@ -69,7 +69,7 @@ variables:
   pca_reference_dir:
     description: >-
       Volume dir where the pca module stages the HGDP+1kGP panel (pca owns the ancestry reference).
-      prs reads the panel pgen/pvar from here (build_panel_afreq) as a read-only artifact. Same
+      prs reads the panel pgen/pvar from here (build_panel_stats) as a read-only artifact. Same
       core catalog+schema as pca_v1, so the path resolves cross-module. Run pca_reference_setup first.
     default: /Volumes/${var.core_catalog_name}/${var.core_schema_name}/pca_reference/panel
 
