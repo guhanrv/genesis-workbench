@@ -83,13 +83,20 @@ if pgs_filter:
     wq = wq.where(F.col("pgs_id").isin(pgs_filter))
 
 # distinct (chrom,pos,effect,other) drives the extraction. variant_id = chrom:pos:effect:other,
-# so split it back out. (For genome-wide PGS this collect is large — chunk by chrom to titrate.)
+# so split it back out. Materialize via Arrow (toPandas) — columnar numpy, ~10x lighter on the driver
+# than collect()'ing Python Row objects (matters for a large genome-wide union). The driver still
+# holds the full catalog + FASTA-ref arrays; a guard warns when that grows large (extract per pgs_ids
+# batch / per-chrom then, and titrate the extract cluster's node size).
+UNION_WARN = 20_000_000
 uv = (wq.select("variant_id").distinct()
         .select(F.split("variant_id", ":").alias("p"))
         .select(F.col("p")[0].alias("chrom"), F.col("p")[1].cast("long").alias("pos"),
                 F.col("p")[2].alias("effect"), F.col("p")[3].alias("other")))
-rows = [(r["chrom"], r["pos"], r["effect"], r["other"]) for r in uv.collect()]
-ucat = ext.build_union_catalog(rows)
+uv_pd = uv.toPandas()
+if len(uv_pd) > UNION_WARN:
+    print(f"WARNING: union has {len(uv_pd):,} variants (> {UNION_WARN:,}); the driver builds the full "
+          f"catalog + FASTA-ref — ensure the extract cluster node has headroom, or extract in pgs_ids batches.")
+ucat = ext.build_union_catalog(zip(uv_pd["chrom"], uv_pd["pos"], uv_pd["effect"], uv_pd["other"]))
 print(f"union catalog: {ucat.n_var} variants" + (f" (restricted to {pgs_filter})" if pgs_filter else ""))
 
 # precompute FASTA ref base per catalog position ONCE on the driver (amortized across all samples).

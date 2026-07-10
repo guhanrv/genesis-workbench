@@ -71,7 +71,7 @@ if missing_mode == "mean_impute" and not _use_impute:
 if _use_impute:
     afreq = spark.table("pgs_panel_afreq").select("variant_id", "af_effect")
     dose_sv = dose.select("sample_id", "variant_id", F.col("dose").alias("_d"))
-    raw = (
+    agg = (
         plan.join(wts, ["pgs_id", "weight_sha"])                       # densify: cell × PGS' variants
         .join(afreq, "variant_id", "left")
         .join(dose_sv, ["sample_id", "variant_id"], "left")
@@ -79,17 +79,23 @@ if _use_impute:
         .groupBy("sample_id", "pgs_id", "weight_sha")
         .agg(F.sum(F.col("dose_f") * F.col("weight")).alias("raw_score"),
              F.sum(F.col("_d").isNotNull().cast("int")).alias("n_variants_matched"))  # matched = real coverage
-        .join(plan, ["sample_id", "pgs_id", "weight_sha"])
     )
 else:
-    raw = (
+    agg = (
         dose.join(wts, "variant_id")
         .groupBy("sample_id", "pgs_id", "weight_sha")
         .agg(F.sum(F.col("dose") * F.col("weight")).alias("raw_score"),
              F.count(F.lit(1)).alias("n_variants_matched"))
-        # keep only the exact cells the plan asked for (sparse plans compute nothing extra)
-        .join(plan, ["sample_id", "pgs_id", "weight_sha"])
     )
+
+# Left-join the aggregate onto the plan so EVERY planned cell is written exactly once — a cell whose
+# sample shares no variant with the PGS (zero coverage) still lands as raw=0, matched=0 instead of
+# vanishing (an inner join would drop it, and reconcile would then re-plan it every run forever).
+raw = (
+    plan.join(agg, ["sample_id", "pgs_id", "weight_sha"], "left")
+    .withColumn("raw_score", F.coalesce(F.col("raw_score"), F.lit(0.0)))
+    .withColumn("n_variants_matched", F.coalesce(F.col("n_variants_matched"), F.lit(0)))
+)
 
 # coverage vs the PGS' total variant count (from registry)
 nvar = spark.table("pgs_registry").select("pgs_id", F.col("n_variants").alias("pgs_nvar"))

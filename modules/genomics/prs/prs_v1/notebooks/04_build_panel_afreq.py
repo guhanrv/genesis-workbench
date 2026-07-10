@@ -59,18 +59,21 @@ uni = (wq.select("variant_id").distinct().select(F.split("variant_id", ":").alia
        .select(F.col("p")[0].alias("chrom"), F.col("p")[1].cast("long").alias("pos"),
                F.col("p")[2].alias("effect"), F.col("p")[3].alias("other")))
 uni_pd = uni.toPandas()
-want_pos = set(zip(uni_pd["chrom"].astype(str), uni_pd["pos"].astype("int64")))
-print(f"union variants: {len(uni_pd):,} ({len(want_pos):,} distinct positions)")
+print(f"union variants: {len(uni_pd):,}")
 
-# ordered pvar (driver) → keep only rows at union positions, with their global pgen index
+# ordered pvar (driver) → keep only rows at union positions, with their GLOBAL pgen index (gidx = row
+# position in the full pvar, which pgenlib reads by). We must scan the full pvar's CHROM/POS to know
+# those global positions (a predicate-pushdown filter would renumber rows and break gidx), but we do
+# the membership VECTORISED via integer-encoded keys — no per-row Python string over the ~10^8-row
+# pvar (that Series-of-f-strings was the OOM). key = chrom-category-code<<40 | pos (human pos < 2^40).
 pv = pq.read_table(pvar_parquet, columns=["CHROM", "POS", "REF", "ALT"])
 chrom_np = pv["CHROM"].to_numpy(zero_copy_only=False).astype(str)
-pos_np = pv["POS"].to_numpy()
-# boolean mask for union positions (vectorised set-membership via pandas)
-key = pd.Series(list(map(lambda cp: f"{cp[0]}:{cp[1]}", zip(chrom_np, pos_np))))
-want_key = {f"{c}:{p}" for c, p in want_pos}
-mask = key.isin(want_key).to_numpy()
-gidx = np.nonzero(mask)[0]
+pos_np = pv["POS"].to_numpy().astype(np.int64)
+_cats = sorted(set(chrom_np.tolist()) | set(uni_pd["chrom"].astype(str).tolist()))
+pv_key = (pd.Categorical(chrom_np, categories=_cats).codes.astype(np.int64) << 40) | pos_np
+uni_key = ((pd.Categorical(uni_pd["chrom"].astype(str), categories=_cats).codes.astype(np.int64) << 40)
+           | uni_pd["pos"].astype(np.int64).to_numpy())
+gidx = np.nonzero(np.isin(pv_key, uni_key))[0]
 pvsub = pd.DataFrame({"gidx": gidx, "chrom": chrom_np[gidx], "pos": pos_np[gidx],
                       "ref": pv["REF"].to_numpy(zero_copy_only=False)[gidx],
                       "alt": pv["ALT"].to_numpy(zero_copy_only=False)[gidx]})

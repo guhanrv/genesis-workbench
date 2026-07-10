@@ -2,6 +2,7 @@ resources:
   jobs:
     prs_reference_setup:
       name: prs_reference_setup
+      timeout_seconds: 21600            # 6h backstop for the one-time pgenlib afreq build
 
       # ONE-TIME scoring-reference builder (run on demand, not per scoring run). Builds the panel
       # allele-frequency table (pgs_panel_afreq) used for mean-imputation of missing PGS variants.

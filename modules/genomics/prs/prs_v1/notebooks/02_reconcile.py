@@ -68,9 +68,7 @@ samples = spark.table("dosage").select("sample_id").distinct()
 if sample_filter:
     samples = samples.where(F.col("sample_id").isin(sample_filter))
 
-desired = samples.crossJoin(
-    registry if panel_version else registry
-)
+desired = samples.crossJoin(registry)
 if panel_version:
     desired = desired.withColumn("panel_version", pv)
 
@@ -86,10 +84,12 @@ existing = spark.table("prs_scores").select(
     "sample_id", "pgs_id",
     F.col("weight_sha").alias("e_sha"), F.col("panel_version").alias("e_pv"),
 )
+# stale iff NOT (stored weight_sha AND panel_version both null-safe-equal the desired). Null-safe (<=>)
+# so a PGS with NO panel_ref row (desired panel_version = NULL) still converges: NULL<=>NULL is a match,
+# so an already-scored NULL-panel_version cell is NOT re-planned every run (idempotent).
 plan = (
     desired.join(existing, ["sample_id", "pgs_id"], "left")
-    .where((F.col("e_sha").isNull()) | (F.col("e_sha") != F.col("weight_sha"))
-           | (F.col("e_pv").isNull()) | (F.col("e_pv") != F.col("panel_version")))
+    .where(~(F.col("e_sha").eqNullSafe(F.col("weight_sha")) & F.col("e_pv").eqNullSafe(F.col("panel_version"))))
     .select("sample_id", "pgs_id", "weight_sha", "panel_version")
 )
 

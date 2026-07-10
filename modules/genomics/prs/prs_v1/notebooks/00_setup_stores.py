@@ -98,6 +98,29 @@ CREATE TABLE IF NOT EXISTS sample_ancestry (
 
 # COMMAND ----------
 
+# MAGIC %md
+# MAGIC ### Data governance (PHI)
+# MAGIC `dosage` / `prs_scores` / `sample_ancestry` hold per-sample genotype-derived data (PHI). Access is
+# MAGIC controlled at the Unity Catalog **catalog/schema** level (the deploying identity owns the schema;
+# MAGIC grant read to consumers explicitly). We additionally **tag** these tables (`data_classification=PHI`
+# MAGIC + a comment) so UC lineage / discovery / policy tooling can find and govern them. Column masks /
+# MAGIC row filters are org-specific UC policies applied out-of-band (a masking UDF + `ALTER TABLE … SET
+# MAGIC MASK`); this module marks the classification so a policy is applied before production PHI lands,
+# MAGIC rather than hardcoding one.
+
+# COMMAND ----------
+
+_PHI = {
+    "dosage": "PHI: per-sample effect-allele dosage (genotype-derived).",
+    "prs_scores": "PHI: per-sample polygenic risk scores.",
+    "sample_ancestry": "PHI: per-sample inferred ancestry.",
+}
+for t, desc in _PHI.items():
+    spark.sql(f"ALTER TABLE {t} SET TBLPROPERTIES ('data_classification' = 'PHI')")   # idempotent
+    spark.sql(f"COMMENT ON TABLE {t} IS '{desc}'")
+
+# COMMAND ----------
+
 for t in ["pgs_registry", "pgs_weights", "pgs_panel_ref", "dosage", "prs_scores", "sample_ancestry"]:
     n = spark.table(t).count()
     print(f"  {catalog}.{schema}.{t}: exists, {n} rows")

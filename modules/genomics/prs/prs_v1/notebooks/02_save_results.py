@@ -3,10 +3,12 @@
 # MAGIC # Publish PRS results + log summary metrics to MLflow
 # MAGIC
 # MAGIC Terminal step of the scoring DAG. Reads the fixed `prs_scores` cell-store (written by
-# MAGIC `01_score_prs`) and records cohort-level summary metrics on the MLflow run — coverage, how many
-# MAGIC cells carried a reference-panel `z_msp` / admixed `z_admixed`, and the raw-score distribution. Mirrors
-# MAGIC `pca_v1/02_save_results`. (Per-run wide result tables are gone — results live in the MERGE-upserted
-# MAGIC `prs_scores`; this step summarizes what the run produced rather than re-materializing it.)
+# MAGIC `01_score_prs`) and logs summary metrics on the MLflow run — coverage, how many cells carry a
+# MAGIC reference-panel `z_msp` / admixed `z_admixed`, and the raw-score distribution. Mirrors
+# MAGIC `pca_v1/02_save_results`. NOTE: because scoring is incremental (MERGE-upserted), these are
+# MAGIC **store-wide totals** over the whole `prs_scores` table (all runs to date), NOT just the cells
+# MAGIC this run computed — the metric keys are `store_*` to make that explicit. (Per-run wide result
+# MAGIC tables are gone — results live in `prs_scores`.)
 
 # COMMAND ----------
 
@@ -60,11 +62,12 @@ mlflow.set_tracking_uri("databricks")
 if mlflow_run_id.strip():
     with mlflow.start_run(run_id=mlflow_run_id):
         mlflow.log_param("results_table", f"{catalog}.{schema}.prs_scores")
+        # store_* prefix: these are cumulative store totals, not this run's cells (incremental MERGE)
         for k in ("n_cells", "n_samples", "n_pgs", "n_z_msp", "n_z_admixed"):
-            mlflow.log_metric(k, int(agg[k]))
+            mlflow.log_metric(f"store_{k}", int(agg[k]))
         for k in ("mean_raw", "sd_raw", "mean_coverage_pct", "frac_small_score"):
             if agg[k] is not None:
-                mlflow.log_metric(k, float(agg[k]))
+                mlflow.log_metric(f"store_{k}", float(agg[k]))
         mlflow.set_tag("job_status", "prs_complete")
     print("PRS results published — MLflow run updated")
 else:
