@@ -20,6 +20,7 @@ dbutils.widgets.text("phenotype_column", "phenotype", "Phenotype column")
 dbutils.widgets.text("contigs", "6", "Contigs to analyze (comma-separated)")
 dbutils.widgets.text("hwe_cutoff", "0.01", "HWE p-value cutoff")
 dbutils.widgets.text("pvalue_threshold", "0.01", "GWAS p-value threshold for Firth correction")
+dbutils.widgets.text("correction", "approx-firth", "Firth correction: approx-firth | none")
 dbutils.widgets.text("pca_scores_table", "", "Ancestry-PC covariates: pca_components table from pca_v1 (empty = UNADJUSTED)")
 dbutils.widgets.text("mlflow_run_id", "", "MLflow Run ID")
 dbutils.widgets.text("user_email", "a@b.com", "User Email")
@@ -31,6 +32,7 @@ mlflow_run_id = dbutils.widgets.get("mlflow_run_id")
 contigs = dbutils.widgets.get("contigs")
 hwe_cutoff = float(dbutils.widgets.get("hwe_cutoff"))
 pvalue_threshold = float(dbutils.widgets.get("pvalue_threshold"))
+correction = dbutils.widgets.get("correction").strip() or "approx-firth"
 pca_scores_table = dbutils.widgets.get("pca_scores_table").strip()
 
 # COMMAND ----------
@@ -56,6 +58,7 @@ mlflow_run_id = dbutils.widgets.get("mlflow_run_id")
 contigs = dbutils.widgets.get("contigs")
 hwe_cutoff = float(dbutils.widgets.get("hwe_cutoff"))
 pvalue_threshold = float(dbutils.widgets.get("pvalue_threshold"))
+correction = dbutils.widgets.get("correction").strip() or "approx-firth"
 pca_scores_table = dbutils.widgets.get("pca_scores_table").strip()   # re-read (restartPython wiped state)
 
 # COMMAND ----------
@@ -218,8 +221,13 @@ if pca_scores_table:
     if missing:
         raise ValueError(f"{missing}/{len(cov)} phenotyped samples have no PCs in {tbl} — run "
                          f"pca_v1/pca_compute on this cohort's VCF so every sample has covariates.")
-    covariate_pdf = cov
-    print(f"GWAS adjusted for {cov.shape[1]} ancestry PCs from {tbl}")
+    # standardize each PC (z-score) before regression: pca_v1's scores are on the raw eigenvalue
+    # scale (pcs_ref = V·s, magnitude ∝ √n_var), and feeding large-magnitude covariates into the
+    # (Firth) logistic saturates the linear predictor and degenerates the null fit. Standardizing is
+    # standard practice for regression covariates and leaves the fit invariant up to reparametrization.
+    sd = cov.std(ddof=0).replace(0, 1.0)                  # guard a constant PC (std 0)
+    covariate_pdf = (cov - cov.mean()) / sd
+    print(f"GWAS adjusted for {cov.shape[1]} ancestry PCs (standardized) from {tbl}")
 else:
     print("GWAS UNADJUSTED (no pca_scores_table) — pass pca_v1's pca_components for structure control")
 
@@ -228,7 +236,7 @@ results = glow.gwas.logistic_regression(
     phenotype_pdf,
     covariate_pdf,
     values_column='values',
-    correction='approx-firth',
+    correction=correction,
     pvalue_threshold=pvalue_threshold,
     contigs=contig_list
 )
