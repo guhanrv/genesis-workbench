@@ -57,6 +57,9 @@ def fit_pca_model(
     scores_table: str | None = None,
     local_npz: str | None = None,
     backend: str = "driver",
+    rsvd_oversample: int = 10,
+    rsvd_power_iter: int = 2,
+    rsvd_seed: int = 0,
 ):
     """LD-prune ``qc_df`` → FRAPOSA fit → write the projectable model npz to ``out_path``.
 
@@ -72,6 +75,16 @@ def fit_pca_model(
         Numerically equivalent PCA (not bit-identical — different float accumulation order), so the
         reference basis stays on ``"driver"``. The samples² Gram itself must still fit the driver
         (~tens of thousands of samples), which is the intrinsic limit of a samples² PCA.
+      - ``"randomized"`` — matrix-free randomized SVD (Halko 2011), the biobank-scale backend. NEVER
+        forms the samples² Gram (which is ~80 GB at 100k / ~2 TB at 500k samples — infeasible to build
+        *or* eigh), so it lifts the *sample*-axis ceiling that caps both ``driver`` and ``distributed``.
+        Only distributed matvecs against the standardized matrix X: a random sketch ``Q = qr(Xᵀ Ω)``
+        (Ω seeded per-``vidx`` → reproducible), ``rsvd_power_iter`` power iterations ``Q = qr(Xᵀ(XQ))``
+        for spectral accuracy, then a small ``svd(XQ)`` on the driver. Fixed ~4–6 Spark passes
+        regardless of ``dim`` (vs Lanczos/IRAM's O(k) sequential matvecs — chosen because this harness
+        is orchestration-bound). ``rsvd_oversample`` extra sketch columns (Halko's ``p``, default 10)
+        buy accuracy on the trailing PCs. Approximate top-``dim_online`` PCA, not bit-identical, so the
+        reference basis stays on ``"driver"``. (An out-of-core IRAM backend is a further follow-up.)
     """
     n_panel = len(sample_ids)
     # clamp to rank: eigh yields n_panel eigenvectors, and per-variant mean-centering makes the all-ones
@@ -91,7 +104,10 @@ def fit_pca_model(
     def _prune_chrom(pdf):
         import numpy as _np
         from bisect import bisect_left
-        pdf = pdf.sort_values("pos")
+        # sort by (pos, vidx): pos alone leaves same-position variants (multiallelic sites split to
+        # biallelic) in executor-dependent input order (stable sort), so the greedy prune would keep a
+        # different one across runs. vidx is unique → fully deterministic order regardless of input.
+        pdf = pdf.sort_values(["pos", "vidx"])
         pos = pdf["pos"].to_numpy()
         # each group is one chunk_bp position slice of a chromosome (not a whole chromosome), so D is
         # bounded regardless of chromosome size. stack without .tolist()'s Python list-of-lists
@@ -108,7 +124,12 @@ def fit_pca_model(
             lo = bisect_left(kpos, pos[i] - window_bp)
             if lo < len(kidx):
                 rr = (Z[kidx[lo:]].astype(_np.float64) @ Z[i].astype(_np.float64) * inv) ** 2
-                if (rr >= r2).any():
+                # Round before the threshold compare: the BLAS dot's summation order differs by executor
+                # (~1e-15 ULPs), which flips a boundary variant's keep/drop across runs and cascades
+                # through the greedy prune → a non-reproducible basis. Rounding to 1e-6 (>> the ULP noise,
+                # << any meaningful r²) makes the decision deterministic across nodes/worker-counts; the
+                # effective threshold shifts by <1e-6, immaterial for an LD-prune heuristic.
+                if (_np.round(rr, 6) >= r2).any():
                     continue
             kpos.append(int(pos[i])); kidx.append(i); keep[i] = True
         return pdf.loc[keep, ["vidx", "chrom", "pos", "ref", "alt"]]
@@ -118,7 +139,13 @@ def fit_pca_model(
     # approximation vs a whole-chromosome prune is at slice seams (immaterial for a PCA basis).
     qc_chunked = qc_df.withColumn("chunk", (F.col("pos") / F.lit(chunk_bp)).cast("long"))
     kept = qc_chunked.groupBy("chrom", "chunk").applyInPandas(_prune_chrom, schema=PRUNE_SCHEMA)
-    kept = kept.orderBy(F.col("chrom").cast("int"), "pos")            # stable variant order
+    kept = kept.orderBy(F.col("chrom").cast("int"), "pos", "vidx")    # deterministic order (vidx breaks pos ties)
+    # Materialize the pruned set ONCE (freeze lineage): _prune_chrom's greedy r² can keep/drop a
+    # boundary variant differently across RE-evaluations when float-summation order differs by executor.
+    # `kept` is consumed twice (kept_pd → order_by_vidx here, and the kept_dose join below); if it were
+    # recomputed the two could disagree → a vidx in kept_dose missing from order_by_vidx → KeyError in
+    # the fit. Deterministic on a single node, NOT across workers — so this is required for multi-node.
+    kept = kept.localCheckpoint(eager=True)
     kept_pd = kept.toPandas()
     n_var = len(kept_pd)
     order_by_vidx = {int(v): i for i, v in enumerate(kept_pd["vidx"].tolist())}
@@ -129,11 +156,15 @@ def fit_pca_model(
     if backend == "distributed":
         mean, std, s_on, V_on, pcs_ref, U_on = _fit_distributed(
             spark, kept_dose, order_by_vidx, n_var, n_panel, dim_ref, dim_online)
+    elif backend == "randomized":
+        mean, std, s_on, V_on, pcs_ref, U_on = _fit_randomized(
+            spark, kept_dose, order_by_vidx, n_var, n_panel, dim_ref, dim_online,
+            n_oversample=rsvd_oversample, n_power_iter=rsvd_power_iter, seed=rsvd_seed)
     elif backend == "driver":
         mean, std, s_on, V_on, pcs_ref, U_on = _fit_driver(
             kept_dose, order_by_vidx, n_var, dim_ref, dim_online)
     else:
-        raise ValueError(f"backend must be 'driver' or 'distributed', got {backend!r}")
+        raise ValueError(f"backend must be 'driver', 'distributed' or 'randomized', got {backend!r}")
 
     # --- 3. Persist the ONE projectable model (same shape as lib/prs_ancestry.fit_panel_basis) ---
     local_npz = local_npz or os.path.join(tempfile.gettempdir(), "pca_basis.npz")
@@ -234,4 +265,72 @@ def _fit_distributed(spark, kept_dose, order_by_vidx, n_var, n_panel, dim_ref, d
         i = order_by_vidx[int(vidx)]
         mean[i, 0] = m; std[i, 0] = s; U_on[i, :] = np.asarray(u)
     print(f"eigendecomposition (distributed Gram): top s = {np.round(s_on[:dim_ref], 1)}")
+    return mean, std, s_on, V_on, pcs_ref, U_on
+
+
+def _fit_randomized(spark, kept_dose, order_by_vidx, n_var, n_panel, dim_ref, dim_online,
+                    *, n_oversample=10, n_power_iter=2, seed=0):
+    """Matrix-free randomized SVD (Halko 2011) of the standardized variant matrix X (n_var × n_panel).
+
+    NEVER forms the n_panel² Gram (the ceiling of both other backends — ~80 GB at 100k samples), so it
+    scales the *sample* axis to biobank size. Only distributed matvecs against X: sketch the sample
+    space Q = qr(Xᵀ Ω), refine with power iterations Q = qr(Xᵀ(XQ)), then a small svd(XQ) on the driver.
+    Every per-partition reduce is (n_panel × ℓ) and every broadcast is (n_panel × ℓ) or (ℓ × ℓ); the only
+    n_var-sized object (loadings U_on) is collected once at the end, exactly like the other backends.
+
+    Reproducible: Ω is drawn per-``vidx`` from a seeded RNG, so the sketch is deterministic across runs.
+    Approximate (not bit-identical); PCA sign is arbitrary. Classic cluster (uses the RDD API)."""
+    ell = min(dim_online + n_oversample, n_panel)      # sketch width ℓ = target rank + oversampling
+
+    def _standardize(row):
+        d = np.asarray(row["dose"], dtype=np.float64)   # length n_panel, NaN = missing
+        obs = d[~np.isnan(d)]
+        m = float(obs.mean()) if obs.size else 0.0
+        s = float(obs.std()) if obs.size else 0.0       # ddof=0, matches FRAPOSA
+        if s == 0.0:
+            s = 1.0
+        z = (d - m) / s
+        z[np.isnan(z)] = 0.0                            # missing → 0 after standardize
+        return (int(row["vidx"]), m, s, z)
+
+    std_rows = kept_dose.rdd.map(_standardize).cache()
+
+    def _outer_sum(coeff_fn):
+        """Σ_v outer(z_v, c_v) → (n_panel × ℓ), where coeff_fn(t) = (z_v (n_panel,), c_v (ℓ,))."""
+        def seq(acc, t):
+            z, c = coeff_fn(t)
+            return acc + np.outer(z, c)
+        return std_rows.treeAggregate(
+            np.zeros((n_panel, ell)), seq, lambda a, b: a + b, depth=2)
+
+    # Sketch: Y = Xᵀ Ω = Σ_v z_v ⊗ ω_v, Ω[v] drawn from a per-vidx seeded RNG (reproducible, no
+    # n_var × ℓ broadcast). Q spans the approximate sample-space range of Xᵀ.
+    def _omega(vidx):
+        return np.random.default_rng((seed << 32) ^ (int(vidx) & 0xFFFFFFFF)).standard_normal(ell)
+    Q, _ = np.linalg.qr(_outer_sum(lambda t: (t[3], _omega(t[0]))))
+
+    # Power iterations: Q = qr(Xᵀ(X Q)). X Q per-variant is z_v·Q (ℓ,), so Xᵀ(XQ) = Σ_v z_v ⊗ (z_v·Q).
+    for _ in range(n_power_iter):
+        Qb = spark.sparkContext.broadcast(Q)
+        Q, _ = np.linalg.qr(_outer_sum(lambda t: (t[3], np.asarray(t[3]) @ Qb.value)))
+        Qb.unpersist()
+
+    # Project: B = X Q (n_var × ℓ), collected once with per-variant mean/std (small: n_var × ℓ).
+    Qb = spark.sparkContext.broadcast(Q)
+    triples = std_rows.map(
+        lambda t: (t[0], t[1], t[2], (np.asarray(t[3]) @ Qb.value).tolist())).collect()
+    Qb.unpersist(); std_rows.unpersist()
+
+    B = np.zeros((n_var, ell)); mean = np.zeros((n_var, 1)); std = np.zeros((n_var, 1))
+    for vidx, m, s, b in triples:                       # reassemble in stable (chrom, pos) order
+        i = order_by_vidx[int(vidx)]
+        mean[i, 0] = m; std[i, 0] = s; B[i, :] = np.asarray(b)
+
+    # X ≈ (X Q) Qᵀ = B Qᵀ; svd(B) = Ub Σ Wᵀ ⇒ loadings U = Ub, singular values s = Σ, scores V = Q W.
+    Ub, s_all, Wt = np.linalg.svd(B, full_matrices=False)   # descending
+    V_all = Q @ Wt.T                                    # (n_panel × ℓ) sample-space right singular vecs
+    s_on = s_all[:dim_online]; V_on = V_all[:, :dim_online]
+    pcs_ref = V_all[:, :dim_ref] * s_all[:dim_ref]
+    U_on = Ub[:, :dim_online]
+    print(f"randomized SVD (ℓ={ell}, q={n_power_iter}): top s = {np.round(s_on[:dim_ref], 1)}")
     return mean, std, s_on, V_on, pcs_ref, U_on

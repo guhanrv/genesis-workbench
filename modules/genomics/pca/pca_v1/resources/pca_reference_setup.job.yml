@@ -62,22 +62,24 @@ resources:
           default: ${var.pca_reference_dir}/GRCh38_HGDP+1kGP_ALL.pvar.parquet
 
       job_clusters:
+        # The 84M-variant QC scan is CPU-bound and saturates a single node (~100% on 8 cores → ~55 min).
+        # It's embarrassingly parallel over variant blocks, so scale it HORIZONTALLY with workers (the
+        # cloud-portable knob — a bigger node_type would be cloud-specific). num_workers=4 → ~4× the QC
+        # cores → basis build drops proportionally; titrate up for faster one-time builds. This is only
+        # feasible now that the pvar broadcast is compact Arrow (~2 GB, not the old ~15 GB object array —
+        # a 15 GB broadcast to N workers would be prohibitive). The driver still runs the small fit
+        # (collect the pruned panel → eigh); default driver heap + maxResultSize=8g covers the ~2 GB collect.
         - job_cluster_key: pca_ref_cluster        # panel download + pgenlib/Spark reference build (no plink2)
           new_cluster:
             spark_version: 15.4.x-scala2.12
             node_type_id: ${var.cpu_node_type}
-            data_security_mode: SINGLE_USER
+            driver_node_type_id: ${var.cpu_node_type}
+            data_security_mode: SINGLE_USER        # SINGLE_USER (not shared) → RDD/MLlib for the distributed fit backend
             runtime_engine: STANDARD
-            num_workers: 0
+            num_workers: 4                          # QC scan is worker-scalable — titrate for speed
             spark_conf:
-              spark.databricks.cluster.profile: singleNode
-              spark.master: "local[*, 2]"          # cap concurrent LD-prune tasks (each holds a ~25 Mb chunk's dose)
-              # Shrink the JVM heap so the pandas-UDF Python workers (prune) + driver numpy fit have room:
-              # the single-node default heap (~40 GB of 64) starves Python and OOMs the post-QC phases.
-              spark.driver.memory: "16g"
               spark.driver.maxResultSize: "8g"     # for the ~2 GB pruned-panel collect in the driver fit
             custom_tags:
-              ResourceClass: SingleNode
               work_type: pca_reference_setup
             enable_elastic_disk: true
 
