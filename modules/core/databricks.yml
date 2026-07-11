@@ -9,7 +9,9 @@ include:
   - resources/mcp_app.yml
   - resources/volumes/*.yml
   - resources/experiments/*.yml
-  - resources/dashboards/*.yml
+  # dashboards/*.yml dropped: the admin dashboard resource resolves a hardcoded
+  # dashboard id at deploy time that doesn't exist in a fresh workspace. Not
+  # needed for the genomics eval.
 
 sync:
   paths:

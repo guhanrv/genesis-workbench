@@ -53,7 +53,7 @@ echo "Installing Poetry"
 
 #curl -sSL https://install.python-poetry.org | python3 -
 #export PATH="/root/.local/bin:$PATH"
-pip install poetry
+command -v poetry >/dev/null 2>&1 || python3 -m pip install poetry
 
 echo "================================"
 echo "⚙️ Preparing to deploy module $CWD"

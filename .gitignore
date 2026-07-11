@@ -1,6 +1,9 @@
 .databricks/
 build/
 dist/
+# deploy.sh rebuilds this wheel into app/backend/lib on every deploy (poetry build + cp) — it's a
+# regenerated artifact, not source. The dist/ copy is already ignored; ignore the staged copy too.
+modules/core/app/backend/lib/*.whl
 __pycache__/
 *.egg-info
 .venv/
