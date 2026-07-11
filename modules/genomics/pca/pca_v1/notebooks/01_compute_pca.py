@@ -8,11 +8,13 @@
 # MAGIC One fit, one output contract: it emits a projectable model npz (loadings/mean/std/loci/scores)
 # MAGIC plus a per-sample scores table — the PCs a GWAS adjusts for (genesis's GWAS runs unadjusted).
 # MAGIC
-# MAGIC No Glow, no RDD API. The fit does a driver-side `eigh` on the samples² Gram (the projectable
-# MAGIC basis needs variant loadings, which `spark.ml.PCA` can't emit in this orientation); it collects
-# MAGIC the pruned matrix to the driver — fine at cohort scale, but a very large cohort should run on a
-# MAGIC classic driver like the reference job (see `lib/pca_fit`'s scale note). A fully distributed-Gram
-# MAGIC backend for the huge-cohort regime is a documented follow-up.
+# MAGIC No Glow, no RDD API. The default fit does a driver-side `eigh` on the samples² Gram (the
+# MAGIC projectable basis needs variant loadings, which `spark.ml.PCA` can't emit in this orientation);
+# MAGIC it collects the pruned matrix to the driver — fine at cohort scale. Larger cohorts set
+# MAGIC `backend=distributed` (samples² Gram computed distributedly, still eigh'd on the driver). At
+# MAGIC **biobank scale** the samples² Gram itself is infeasible (~80 GB at 100k samples); `backend=randomized`
+# MAGIC is the matrix-free RSVD path that never forms it (see `lib/pca_fit`'s backend note). All three
+# MAGIC emit the identical projectable-model contract.
 
 # COMMAND ----------
 
@@ -24,7 +26,7 @@ dbutils.widgets.text("max_variants", "0", "Cap SNPs used (0 = all; M is unbounde
 dbutils.widgets.text("r2", "0.05", "LD-prune r² threshold (prune if ≥)")
 dbutils.widgets.text("window_bp", "1000000", "LD-prune window (bp)")
 dbutils.widgets.text("model_dir", "", "Volume dir to write the projectable model npz (pca_model_<run>.npz)")
-dbutils.widgets.text("backend", "driver", "PCA fit backend: driver (default) | distributed (large cohorts, classic cluster)")
+dbutils.widgets.text("backend", "driver", "PCA fit backend: driver (default) | distributed (large cohorts) | randomized (biobank scale, matrix-free RSVD)")
 dbutils.widgets.text("mlflow_run_id", "", "MLflow Run ID")
 
 catalog = dbutils.widgets.get("catalog")

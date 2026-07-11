@@ -52,6 +52,13 @@ planned_pgs = plan.select("pgs_id", "weight_sha").distinct()
 # files instead of scanning the whole store. Stage-0 measured that a broadcast join here re-scans
 # all dosage rows even to score one new sample; the predicate turns that full scan into a file-skip.
 # Full backfills (many planned samples) skip the predicate and read all files (correct + fastest).
+# Broadcast the planned weights when they're small enough (used by the drop-path join below). EXPLAIN
+# (benchmark/SCALE_LADDER_1K_FINDINGS.md) showed `dose ⋈ wts` defaults to a SortMergeJoin — `wts` is a
+# derived relation whose size the optimizer over-estimates, so it never auto-broadcasts even when tiny and
+# AQE doesn't convert it — shuffling the whole dose side (~2.2 GB per 128M rows). ~3M weight rows ≈ a few
+# hundred MB broadcast, safe on the compute cluster's 16g driver; larger unions exceed this and correctly
+# stay a shuffle join (chunk that backfill by sample batch).
+WEIGHTS_BROADCAST_MAX_ROWS = 3_000_000
 SAMPLE_PREDICATE_MAX = 200
 _planned_ids = [r["sample_id"] for r in planned_samples.limit(SAMPLE_PREDICATE_MAX + 1).collect()]
 if 0 < len(_planned_ids) <= SAMPLE_PREDICATE_MAX:
@@ -83,8 +90,12 @@ if _use_impute:
              F.sum(F.col("_d").isNotNull().cast("int")).alias("n_variants_matched"))  # matched = real coverage
     )
 else:
+    # Force-broadcast the weights when broadcast-safe so the dose STREAMS (no ~2.2 GB dose shuffle) and
+    # sum() aggregates map-side; a large union exceeds the guard and stays a shuffle join. See the
+    # WEIGHTS_BROADCAST_MAX_ROWS note above (EXPLAIN-confirmed: default is SortMergeJoin even for tiny wts).
+    _wts = F.broadcast(wts) if wts.count() <= WEIGHTS_BROADCAST_MAX_ROWS else wts
     agg = (
-        dose.join(wts, "variant_id")
+        dose.join(_wts, "variant_id")
         .groupBy("sample_id", "pgs_id", "weight_sha")
         .agg(F.sum(F.col("dose") * F.col("weight")).alias("raw_score"),
              F.count(F.lit(1)).alias("n_variants_matched"))

@@ -36,7 +36,7 @@ serves `prs` as a read-only Volume artifact.
 | `max_variants` | 0 | optional SNP cap for runtime (0 = all; applied deterministically after an order-by) |
 | `r2` | 0.05 | LD-prune r² threshold (prune a variant with r² ≥ this to a kept one in-window) |
 | `window_bp` | 1000000 | LD-prune window (bp) |
-| `backend` | `driver` | fit backend: `driver` (collect + `eigh`) or `distributed` (samples² Gram via RowMatrix; large cohorts) |
+| `backend` | `driver` | fit backend: `driver` (collect + `eigh`), `distributed` (samples² Gram via RowMatrix; large cohorts), or `randomized` (matrix-free RSVD; biobank scale — never forms the Gram) |
 
 ## Deploy
 
@@ -57,11 +57,19 @@ Requires `core` (catalog/schema, the `libraries` volume with the Glow JAR + whee
   loadings, which `spark.ml.PCA` can't in this orientation), and the `distributed` backend uses the
   RDD/MLlib API — neither works on serverless. Only `pca_compute`'s `save_results`/`mark_*` stay
   serverless (they just read a table / log MLflow).
-- Two backends, one output contract: `driver` (default) for cohort/reference scale; `distributed`
+- Three backends, one output contract: `driver` (default) for cohort/reference scale; `distributed`
   (`backend=distributed`) computes the samples² Gram via `RowMatrix` + loadings via a distributed map,
   never collecting the full variant × sample matrix — its win over `driver` is relieving the
   *variant*-axis driver-memory ceiling for large in-cohort GWAS PCA. The samples² Gram itself must
-  still fit the driver (~tens of thousands of samples — the intrinsic limit of a samples² PCA). The
+  still fit the driver (~tens of thousands of samples — the intrinsic limit of a samples² PCA), which
+  is the wall both hit at **biobank scale** (a 100k² Gram is ~80 GB, 500k² ~2 TB — infeasible to build
+  *or* eigh). `randomized` (`backend=randomized`) is the matrix-free path for that regime: Halko RSVD
+  over distributed matvecs against X that **never forms the Gram** — a seeded random sketch, a few
+  power iterations (`rsvd_power_iter`, default 2) and oversampling (`rsvd_oversample`, default 10),
+  then a small `svd` on the driver. It lifts the *sample*-axis ceiling to biobank size in a fixed ~4–6
+  Spark passes (vs Lanczos/IRAM's O(k) sequential matvecs — RSVD is chosen because this harness is
+  orchestration-bound; an out-of-core IRAM backend is a further follow-up). Approximate top-k PCA, not
+  bit-identical, so the reference basis stays on `driver`. The
   `pca_compute_cluster` is single-node (`num_workers: 0`) by default — `distributed` already helps
   there; **titrate `num_workers` up for horizontal shuffle/compute scale**. LD-prune is built in
   (`r2`/`window_bp`); QC is autosomal-only.
