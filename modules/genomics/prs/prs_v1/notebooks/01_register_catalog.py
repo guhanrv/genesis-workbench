@@ -137,6 +137,15 @@ nv = {r["pgs_id"]: (r["n_variants"], r["weight_sha"]) for r in
       .groupBy("pgs_id").agg(F.count("*").alias("n_variants"),
                              F.first("weight_sha").alias("weight_sha")).collect()}
 
+# Fail loudly (don't silently drop): a PGS whose scorefile was found but parsed to 0 usable weight rows
+# would otherwise just vanish from the registry (the `if pgs_id not in nv: continue` below). That hides
+# a malformed/empty scorefile or an all-palindromic-drop. Surface it prominently.
+_zero_var = sorted({p for p, _ in present} - set(nv))
+if _zero_var:
+    print(f"WARNING: {len(_zero_var)} scorefile(s) parsed to 0 usable variants and are being DROPPED "
+          f"from the registry — inspect for malformed/empty files, wrong columns, or all-palindromic "
+          f"variants: {_zero_var}")
+
 registry_rows, panel_rows = [], []
 path_by_pgs = dict(present)
 for s in scores:

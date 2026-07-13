@@ -129,7 +129,16 @@ if not reextract and spark.catalog.tableExists("dosage"):
     have = {r["sample_id"] for r in spark.table("dosage").select("sample_id").distinct().collect()}
     before = len(manifest)
     manifest = [(s, p) for (s, p) in manifest if s not in have]
-    print(f"incremental: skipping {before - len(manifest)} already-extracted sample(s); {len(manifest)} to extract")
+    skipped = before - len(manifest)
+    print(f"incremental: skipping {skipped} already-extracted sample(s); {len(manifest)} to extract")
+    # DRIFT CAVEAT: the skip is sample-granular — it does NOT know whether the registered PGS union
+    # grew since a sample was extracted. If you added a PGS (new union variants), previously-extracted
+    # samples are NOT re-extracted here and will silently UNDER-COVER the new variants (scored as
+    # missing → mean-imputed). After any add-PGS / re-register, run with reextract=true (or restrict to
+    # the affected samples). TODO: track a per-sample union signature to auto-detect this.
+    if skipped:
+        print("  WARNING: if the PGS union changed since these samples were extracted, re-run with "
+              "reextract=true — otherwise their new-variant coverage is silently incomplete.")
 
 if not manifest:
     dbutils.notebook.exit("0 — nothing to extract (all samples present; use reextract=true to force)")
@@ -152,6 +161,17 @@ uv_all = (wq.select("variant_id").distinct()
             .select(F.split("variant_id", ":").alias("p"))
             .select(F.col("p")[0].alias("chrom"), F.col("p")[1].cast("long").alias("pos"),
                     F.col("p")[2].alias("effect"), F.col("p")[3].alias("other")))
+
+# Ploidy caveat: the dose kernel assumes DIPLOID (REF-block dose = 2, HDS REF orientation = 2 - alt).
+# For haploid regions (male chrX/Y, chrM) that over-counts homozygous-REF blocks. Autosomes are safe.
+# Warn (don't silently mis-score) if the registered union includes non-autosomal variants.
+_AUTOSOMES = {str(i) for i in range(1, 23)} | {f"chr{i}" for i in range(1, 23)}
+_nonauto = uv_all.where(~F.col("chrom").isin(list(_AUTOSOMES))).select("chrom").distinct()
+_nonauto_ct = [r["chrom"] for r in _nonauto.collect()]
+if _nonauto_ct:
+    print(f"WARNING: registered union includes non-autosomal contigs {sorted(_nonauto_ct)} — dose assumes "
+          f"diploid, so male chrX/Y and chrM homozygous-REF blocks may be over-counted. Review before "
+          f"trusting scores that depend on these PGS variants.")
 
 # fasta-ref cache is content-addressed on the registered (pgs, weight_sha) set + FASTA — identical across
 # runs, so a repeat/incremental run reads the cached .npz instead of rebuilding. Key computed ONCE here;

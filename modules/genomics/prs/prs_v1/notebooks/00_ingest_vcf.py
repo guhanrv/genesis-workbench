@@ -2,6 +2,10 @@
 # MAGIC %md
 # MAGIC # PRS ingest — VCF → long effect-oriented `dosage` (Glow; classic, NOT serverless)
 # MAGIC
+# MAGIC > **MANUAL-RUN ONLY.** This is the non-gVCF sibling engine and is intentionally NOT wired into any
+# MAGIC > job (`resources/*.job.yml`); the deployed `prs_scoring` DAG uses `02_extract_dosage` (gVCF). Run
+# MAGIC > this notebook by hand for dosage/hard-called VCF cohorts. It writes the SAME `dosage` store.
+# MAGIC
 # MAGIC The **non-gVCF** ingest engine: handles both **imputed dosage VCF** (`DS`/`HDS`, no hard `GT`) and
 # MAGIC **regular hard-called VCF** (`GT`). Glow reads per-sample ALT dosage distributedly (`DS → HDS(summed)
 # MAGIC → GT`, chosen by `dosage_field`), we orient it to each catalog PGS's **effect allele**, and MERGE into

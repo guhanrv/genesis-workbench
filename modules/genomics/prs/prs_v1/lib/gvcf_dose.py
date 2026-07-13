@@ -5,8 +5,12 @@ Adapted from a validated single-node pysam scorer. Two layers:
 
 * Per-target dose primitives — ``_compute_dose_for_target`` and friends —
   decode the right dose from a single VCF/gVCF record + (chrom, pos, ea,
-  oa) target. Handles GT vs HDS, ref-blocks (``END=``), strand-flip vs
-  ref-alt-swap encodings.
+  oa) target. Handles GT vs HDS and ref-blocks (``END=``), and the
+  REF/ALT-swap encoding (effect allele may be the record's REF or ALT).
+  NOTE: strand-flip is NOT handled — the effect/other alleles are matched
+  literally, with no reverse-complement. Inputs must be forward-strand,
+  GRCh38-harmonized (PGS Catalog hmPOS); palindromic (A/T, C/G) variants
+  are dropped at registration so an ambiguous-strand call can't mis-match.
 * Lockstep walk — ``_extract_dose_vector`` walks the user's VCF in one
   pass against a sorted catalog, expanding gVCF reference blocks as it
   goes. Returns a per-target dose array aligned with the catalog.
@@ -62,10 +66,16 @@ def _hds_dose_for_allele(
     """
     if not hds or any(h is None for h in hds):
         return _NAN
+    # Multiallelic (incl. a symbolic <NON_REF> ALT): HDS has len(alts)×ploidy entries, so summing all
+    # of them would fold other-ALT / <NON_REF> posteriors into this ALT's dose (overcount), and the
+    # 2 - alt_dose REF orientation would then also be wrong. Drop instead of miscompute — the variant
+    # becomes missing and is mean-imputed (2·AF) downstream. Only biallelic (REF + 1 ALT) is trusted.
+    if len(alleles) != 2:
+        return _NAN
     alt_dose = float(sum(hds))
-    if alleles and target_allele == alleles[0]:
+    if target_allele == alleles[0]:
         return 2.0 - alt_dose
-    if len(alleles) >= 2 and target_allele == alleles[1]:
+    if target_allele == alleles[1]:
         return alt_dose
     return _NAN
 

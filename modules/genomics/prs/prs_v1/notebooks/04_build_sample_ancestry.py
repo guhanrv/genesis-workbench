@@ -180,10 +180,16 @@ for p in paths:
 print(f"{len(manifest)} gVCF(s) found")
 
 if not reclassify and spark.catalog.tableExists("sample_ancestry"):
-    have = {r["sample_id"] for r in spark.table("sample_ancestry").select("sample_id").distinct().collect()}
+    # Skip only samples ALREADY classified against the CURRENT basis (panel_version). Keying on
+    # sample_id alone would skip a sample after a basis rebuild/version bump, leaving its MSP computed
+    # against the old basis and mixing panel_versions in one table. Now a version change reclassifies.
+    have = {r["sample_id"] for r in
+            spark.table("sample_ancestry").where(F.col("panel_version") == panel_version)
+            .select("sample_id").distinct().collect()}
     before = len(manifest)
     manifest = [(s, p) for (s, p) in manifest if s not in have]
-    print(f"incremental: skipping {before - len(manifest)} already-classified; {len(manifest)} to classify")
+    print(f"incremental: skipping {before - len(manifest)} already-classified at panel_version="
+          f"{panel_version}; {len(manifest)} to classify")
 
 if not manifest:
     dbutils.notebook.exit("0 — nothing to classify (use reclassify=true to force)")
