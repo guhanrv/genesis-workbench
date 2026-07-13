@@ -116,6 +116,16 @@ def _validate_gvcf(p, vf):
             other = next((b for b, L in _CHR1_LEN.items() if L == got), "unknown")
             raise ValueError(f"{p}: chr1 length {got} != {expected_build} ({want}); looks like {other}. "
                              f"Scorefiles are {expected_build}-harmonized — mixing builds mis-scores silently.")
+    # gVCF flavor: the REF-block/FASTA dose path is validated for DeepVariant/DRAGEN-style gVCFs
+    # (reference blocks encoded as no-ALT records with END=). GATK HaplotypeCaller emits symbolic
+    # <NON_REF> REF blocks (REF=A ALT=<NON_REF>), which the current walker does NOT expand — those
+    # loci come back missing, so coverage drops (and the post-extraction coverage floor below will
+    # then fail the run). Detect it up front and warn, rather than let it look like a data problem.
+    if "<NON_REF>" in str(vf.header) or "ID=NON_REF" in str(vf.header):
+        print(f"WARNING: {p} looks like a GATK <NON_REF> gVCF. The REF-block expander is validated for "
+              f"DeepVariant/DRAGEN no-symbolic-ALT blocks; <NON_REF> blocks are not expanded and will "
+              f"under-cover (caught by the coverage floor). Preprocess (e.g. GenotypeGVCFs / drop "
+              f"<NON_REF>) or extend the walker before trusting this cohort.")
     return samples[0]
 
 manifest = []
