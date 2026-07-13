@@ -36,8 +36,6 @@ dbutils.widgets.text("min_coverage_frac", "0.1", "Fraction of basis loci a sampl
 
 catalog = dbutils.widgets.get("catalog")
 schema = dbutils.widgets.get("schema")
-outlier_alpha = float(dbutils.widgets.get("outlier_alpha"))
-min_coverage_frac = float(dbutils.widgets.get("min_coverage_frac"))
 
 # COMMAND ----------
 
@@ -66,6 +64,8 @@ fasta_path = dbutils.widgets.get("fasta_path")
 fasta_ref_cache_dir = dbutils.widgets.get("fasta_ref_cache_dir").strip()
 shard_by_chrom = dbutils.widgets.get("shard_by_chrom").strip().lower() == "true"
 reclassify = dbutils.widgets.get("reclassify").strip().lower() == "true"
+outlier_alpha = float(dbutils.widgets.get("outlier_alpha"))          # read post-restartPython
+min_coverage_frac = float(dbutils.widgets.get("min_coverage_frac"))
 
 spark.sql(f"USE CATALOG {catalog}")
 spark.sql(f"USE SCHEMA {schema}")
