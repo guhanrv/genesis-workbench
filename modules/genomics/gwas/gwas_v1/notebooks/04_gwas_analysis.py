@@ -46,7 +46,11 @@ print(f"Glow wheel: {glow_whl_path}")
 
 # COMMAND ----------
 
-# MAGIC %pip install {glow_whl_path} --force-reinstall
+# MAGIC # NB: no --force-reinstall. It dragged glow's unpinned deps up to pandas 3.0, which breaks
+# MAGIC # glow's reshape_for_gwas label round-trip (empty label -> null-fit state reindexes to all-NaN
+# MAGIC # -> logistic_regression crashes with covariates / degenerate null fit without). Stock DBR
+# MAGIC # pandas 1.5.3 works; glow's other deps still install since they're absent from the base image.
+# MAGIC %pip install {glow_whl_path}
 # MAGIC dbutils.library.restartPython()
 
 # COMMAND ----------
