@@ -1,5 +1,5 @@
 """Pure-Python reference + unit test for the PRS scoring math in
-``notebooks/01_score_prs.py``.
+``notebooks/05_score_prs.py``.
 
 The Spark/Glow notebook can only run on a Databricks cluster, so this test
 re-implements the *allele-orientation rule* — the part with real risk of a sign
@@ -83,7 +83,95 @@ def test_score_samples_worked_example():
     assert res["s2"]["n_variants_matched"] == 2
 
 
+# --- z-calibration regression tests ---------------------------------------
+# Two bugs were found scoring the 6×196 cohort at genome scale; both silently miscalibrated the
+# panel-normalized z. These guard against reverting either. See notebooks/05_score_prs.py and
+# ref_00_build_panel_stats.py (the panel is built under mean-imputation, missing→2·AF).
+import pathlib
+
+_SCORER = pathlib.Path(__file__).resolve().parent.parent / "notebooks" / "05_score_prs.py"
+
+
+def test_scorer_default_is_mean_impute():
+    """Bug (a): the panel z-reference is built under mean-imputation, so members must be scored the
+    same way. A `drop` default computes member raw and panel mean under different missing policies →
+    miscalibrated z. Guard the shipped default."""
+    src = _SCORER.read_text()
+    assert 'dbutils.widgets.text("missing_mode", "mean_impute"' in src, (
+        "05_score_prs default missing_mode must stay mean_impute (matches the mean-imputed panel).")
+
+
+def test_scorer_restricts_to_panel_matched_set():
+    """Bug (b): the member must be scored over EXACTLY the panel-matched variant set (inner-join
+    pgs_panel_afreq). A left-join lets the member sum off-panel variants the panel never scored →
+    raw on a larger scale than the panel distribution → inflated z. Guard the inner join."""
+    src = _SCORER.read_text()
+    assert '.join(afreq, "variant_id", "inner")' in src, (
+        "05_score_prs mean_impute path must inner-join afreq (restrict member to the panel-matched set).")
+
+
+def score_mean_impute(weights, panel_af, member_dose):
+    """Pure-Python reference of the scorer's mean_impute aggregate (the calibrated path).
+
+    Sums over EXACTLY the panel-matched set (variant_ids in ``panel_af``): a covered variant uses its
+    real dose; a missing panel-matched variant is imputed to ``2·AF`` (matching how the panel itself
+    was built); an OFF-panel variant (not in ``panel_af``) is EXCLUDED — the panel has no distribution
+    to standardize it against. ``weights``/``panel_af``/``member_dose`` are {variant_id: value}."""
+    raw, matched = 0.0, 0
+    for vid, w in weights.items():
+        if vid not in panel_af:
+            continue                                # off-panel → excluded
+        if vid in member_dose:
+            d = member_dose[vid]; matched += 1      # covered → real dose (counts as coverage)
+        else:
+            d = 2.0 * panel_af[vid]                 # missing panel variant → 2·AF (panel policy)
+        raw += d * w
+    return {"raw": raw, "n_variants_matched": matched}
+
+
+def _buggy_score_left_join(weights, panel_af, member_dose):
+    """The pre-fix behavior: off-panel variants the member covers ALSO contribute (left-join) →
+    raw on a larger scale than the panel distribution."""
+    raw = 0.0
+    for vid, w in weights.items():
+        if vid in member_dose:
+            raw += member_dose[vid] * w
+        elif vid in panel_af:
+            raw += 2.0 * panel_af[vid] * w
+    return raw
+
+
+def test_mean_impute_excludes_offpanel_and_imputes_missing():
+    weights = {"1:100:A:G": 1.0, "1:200:A:G": 1.0, "1:300:A:G": 50.0}  # 1:300 is heavy + OFF-panel
+    panel_af = {"1:100:A:G": 0.5, "1:200:A:G": 0.5}                    # panel matched only the first two
+    member = {"1:100:A:G": 2.0, "1:300:A:G": 2.0}                      # covers 1:100 & off-panel 1:300; 1:200 missing
+    r = score_mean_impute(weights, panel_af, member)
+    # 1:100 covered (2·1) + 1:200 missing→2·0.5·1 (=1) + 1:300 off-panel EXCLUDED  = 3.0
+    assert r["raw"] == 3.0
+    assert r["n_variants_matched"] == 1                                # only 1:100 is real coverage
+
+
+def test_offpanel_inflation_regression():
+    """The heavy off-panel variant would blow up z if included (bug b). Standardized against the
+    panel distribution (built over the matched set only), the fixed raw stays bounded."""
+    weights = {"1:100:A:G": 1.0, "1:200:A:G": 1.0, "1:300:A:G": 50.0}
+    panel_af = {"1:100:A:G": 0.5, "1:200:A:G": 0.5}
+    member = {"1:100:A:G": 2.0, "1:200:A:G": 2.0, "1:300:A:G": 2.0}
+    panel_mean, panel_sd = 2.0, 1.0                                    # panel's dist over the 2 matched variants
+    raw_fixed = score_mean_impute(weights, panel_af, member)["raw"]    # 2 + 2 = 4 (off-panel excluded)
+    raw_buggy = _buggy_score_left_join(weights, panel_af, member)      # 4 + 100 = 104 (off-panel 50·2)
+    z_fixed = (raw_fixed - panel_mean) / panel_sd
+    z_buggy = (raw_buggy - panel_mean) / panel_sd
+    assert abs(z_fixed) < 5, f"fixed z should be bounded, got {z_fixed}"
+    assert abs(z_buggy) > 50, f"buggy (off-panel-included) z should be wildly inflated, got {z_buggy}"
+
+
 if __name__ == "__main__":
     test_effect_dosage_orientation()
+    test_effect_dosage_continuous()
     test_score_samples_worked_example()
-    print("PRS scoring reference tests passed.")
+    test_scorer_default_is_mean_impute()
+    test_scorer_restricts_to_panel_matched_set()
+    test_mean_impute_excludes_offpanel_and_imputes_missing()
+    test_offpanel_inflation_regression()
+    print("PRS scoring reference + z-calibration regression tests passed.")

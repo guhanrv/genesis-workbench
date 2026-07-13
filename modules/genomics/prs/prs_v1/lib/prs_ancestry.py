@@ -1,6 +1,6 @@
 """FRAPOSA ancestry — panel PCA basis fit (one-time) + per-sample OADP projection (distributable).
 
-Ported faithfully from `function_pca` (the validated single-node engine):
+Ported faithfully from `the reference PCA engine` (the validated single-node engine):
   - `oadp.py`            → svd_online / procrustes / procrustes_diffdim (verbatim)
   - `refit._run_fraposa_oadp_core` → split at its natural seam into `fit_panel_basis`
                            (standardize + SVD + loadings — the one-time panel work) and
@@ -9,8 +9,11 @@ Ported faithfully from `function_pca` (the validated single-node engine):
                            once per sample so it distributes across samples)
   - `ancestry.classify_ancestry` → RF (MSP) + Mahalanobis outlier (verbatim)
 
-`fit_panel_basis(X_panel) + project_member(basis, Xu)` reproduces `_run_fraposa_oadp_core`
-bit-for-bit (same ops, same order) — see the parity test. The point of the split is that the
+`fit_panel_basis(X_panel) + project_member(basis, Xu)` is intended to reproduce the reference
+`_run_fraposa_oadp_core` (same ops, same order). NOTE: a golden-vector parity test against the
+reference output is NOT yet committed — the current tests (`tests/test_prs_ancestry.py`) only cover
+internal determinism/finiteness/round-trip; add the parity fixture before relying on exact
+equivalence. The point of the split is that the
 3942×3942 eigendecomposition happens ONCE (fixed reference basis, à la pgsc_calc) and every
 new sample is just an online-SVD update against the broadcast basis.
 
@@ -22,7 +25,7 @@ from __future__ import annotations
 import numpy as np
 
 
-# ── OADP primitives (verbatim from function_pca/oadp.py) ────────────────────────
+# ── OADP primitives (verbatim from the reference OADP engine) ────────────────────────
 
 def svd_online(U1: np.ndarray, d1: np.ndarray, V1: np.ndarray, b: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     """Online SVD update: append b (length p) to the data, return (s_aug, V_aug).
@@ -107,7 +110,7 @@ def procrustes_diffdim(
     return R, rho, c
 
 
-# ── FRAPOSA standardize + eig (verbatim from function_pca/refit.py) ─────────────
+# ── FRAPOSA standardize + eig (verbatim from the reference FRAPOSA fit) ─────────────
 
 def _fraposa_standardize(X: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     """Per-variant empirical mean and std (ddof=0). Modifies X in place; missing → 0.
@@ -190,7 +193,7 @@ def project_member(basis: dict, Xu: np.ndarray) -> np.ndarray:
     return (pcs_aug[-1:, :] @ R * rho + c).flatten()[:dim_ref]
 
 
-# ── Classification (verbatim from function_pca/ancestry.py) ─────────────────────
+# ── Classification (verbatim from the reference classifier) ─────────────────────
 
 def classify_ancestry(
     panel_pcs: np.ndarray,           # (n_panel, k) full panel PCs
@@ -219,7 +222,9 @@ def classify_ancestry(
 
     cov_all = EmpiricalCovariance().fit(train_pcs)
     d2 = float(cov_all.mahalanobis(X_user)[0])
-    p_all = float(chi2.sf(d2, n_pcs - 1))
+    # Mahalanobis d^2 of a point vs a Gaussian fitted in n_pcs dimensions ~ chi^2(n_pcs).
+    # (Was n_pcs-1, which inflates the survival function and makes outliers look less extreme.)
+    p_all = float(chi2.sf(d2, n_pcs))
 
     clf = RandomForestClassifier(random_state=32)
     clf.fit(train_pcs, train_pops)

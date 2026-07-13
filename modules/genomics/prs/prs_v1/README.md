@@ -15,6 +15,17 @@ z_admixed        = Σ_superpop  P_RF(superpop) · (raw − mean[pgs,pop]) / sd[p
 Normalization is against a **frozen HGDP+1kGP reference panel** (per-superpop), so a new
 sample's z needs no cohort re-rank — unlike naive in-cohort standardization.
 
+## Data governance / PHI (deployer responsibility)
+
+This pipeline processes **individual genomic data (PHI)**. The code cannot enforce consent or
+data-use policy — that is the **deploying organization's responsibility**. Before running against
+real samples: ensure appropriate consent and IRB/data-use agreements are in place; keep the
+`dosage` / `prs_scores` / `sample_ancestry` stores under Unity Catalog governance (they are tagged
+`data_classification=PHI` in `00_setup_stores`; apply column masks / row filters and `GRANT`s per
+your policy — the module does not ship grants). Do **not** stage member genomes into a shared
+sandbox without a governance decision. The reference panel (HGDP+1kGP) and any figures in
+`benchmark/` use public or synthetic/real-scale data only — no member-identifiable data is committed.
+
 ## Persistent Delta stores (`00_setup_stores`)
 
 | store | grain | role |

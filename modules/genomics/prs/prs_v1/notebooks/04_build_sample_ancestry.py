@@ -31,9 +31,13 @@ dbutils.widgets.text("fasta_path", "", "GRCh38 FASTA (.fna.bgz) for REF-block re
 dbutils.widgets.text("fasta_ref_cache_dir", "", "Volume dir to cache the FASTA-ref array (skips the rebuild on repeat runs)")
 dbutils.widgets.text("shard_by_chrom", "true", "Shard extraction (sample × chrom) across chroms/cores")
 dbutils.widgets.text("reclassify", "false", "true = recompute samples already in sample_ancestry")
+dbutils.widgets.text("outlier_alpha", "0.001", "Mahalanobis P below this => PC-space outlier (RF can't be trusted)")
+dbutils.widgets.text("min_coverage_frac", "0.1", "Fraction of basis loci a sample must cover, else flagged outlier")
 
 catalog = dbutils.widgets.get("catalog")
 schema = dbutils.widgets.get("schema")
+outlier_alpha = float(dbutils.widgets.get("outlier_alpha"))
+min_coverage_frac = float(dbutils.widgets.get("min_coverage_frac"))
 
 # COMMAND ----------
 
@@ -50,7 +54,7 @@ import numpy as np
 import pandas as pd
 import pysam
 import pyspark.sql.functions as F
-from pyspark.sql.types import StructType, StructField, StringType, DoubleType, LongType
+from pyspark.sql.types import StructType, StructField, StringType, DoubleType, LongType, BooleanType
 from delta.tables import DeltaTable
 
 catalog = dbutils.widgets.get("catalog")
@@ -269,16 +273,24 @@ from scipy.stats import chi2
 N_PCS = 5  # pgsc_calc classifies on 5 PCs
 clf, cov = anc.fit_rf(pcs_ref, superpops, n_pcs=N_PCS)   # once, on the driver
 
+# is_outlier gate: RF argmax ALWAYS returns a superpop, even for a sample that belongs to no
+# reference population (non-human/contaminated, an ancestry absent from HGDP+1kGP) or that covers
+# almost no basis loci (projects to ~origin). Flag those so the scorer refuses to report a calibrated
+# z against the wrong panel, instead of silently normalizing. Two independent triggers:
+#   - PC-space outlier: Mahalanobis_P_ALL < outlier_alpha (sample far from every superpop cloud)
+#   - low coverage: covered/basis < min_coverage_frac (projection is unreliable / near-origin)
 out_rows = []
 for r in proj_rows:
     pc5 = np.array([r[f"pc{k}"] for k in range(N_PCS)], dtype=np.float64)[None, :]
     probs = clf.predict_proba(pc5)[0]
     msp = str(clf.classes_[int(np.argmax(probs))])
     d2 = float(cov.mahalanobis(pc5)[0])
-    p_all = float(chi2.sf(d2, N_PCS - 1))
+    p_all = float(chi2.sf(d2, N_PCS))                      # df = n_pcs (was N_PCS-1, a bug)
+    cov_frac = (int(r["n_covered"]) / n_loci) if n_loci else 0.0
+    is_outlier = bool(p_all < outlier_alpha or cov_frac < min_coverage_frac)
     rf_probs = {str(c): float(p) for c, p in zip(clf.classes_, probs)}
     out_rows.append((r["sample_id"], msp, p_all, int(r["n_covered"]), n_loci,
-                     panel_version, json.dumps(rf_probs)))
+                     panel_version, json.dumps(rf_probs), is_outlier))
 
 OUT_SCHEMA = StructType([
     StructField("sample_id", StringType()),
@@ -288,6 +300,7 @@ OUT_SCHEMA = StructType([
     StructField("n_loci_basis", LongType()),
     StructField("panel_version", StringType()),
     StructField("rf_probs", StringType()),
+    StructField("is_outlier", BooleanType()),
 ])
 out = (spark.createDataFrame(out_rows, OUT_SCHEMA)
        .withColumn("computed_at", F.current_timestamp()))
@@ -296,14 +309,18 @@ spark.sql("""
 CREATE TABLE IF NOT EXISTS sample_ancestry (
   sample_id STRING, most_similar_pop STRING, mahalanobis_p_all DOUBLE,
   n_loci_covered BIGINT, n_loci_basis BIGINT, panel_version STRING,
-  rf_probs STRING, computed_at TIMESTAMP
+  rf_probs STRING, is_outlier BOOLEAN, computed_at TIMESTAMP
 ) USING DELTA
 """)
+# tolerate a pre-existing table created before is_outlier was added
+spark.conf.set("spark.databricks.delta.schema.autoMerge.enabled", "true")
 out.createOrReplaceTempView("_anc")
 (DeltaTable.forName(spark, f"{catalog}.{schema}.sample_ancestry").alias("t")
  .merge(spark.table("_anc").alias("s"), "t.sample_id = s.sample_id")
  .whenMatchedUpdateAll().whenNotMatchedInsertAll().execute())
 
+n_out = sum(1 for r in out_rows if r[7])
 for r in out_rows:
-    print(f"  {r[0]}: MSP={r[1]}  p_all={r[2]:.3g}  covered={r[3]}/{r[4]}")
-print(f"MERGE-upserted {len(out_rows)} sample(s) → {catalog}.{schema}.sample_ancestry")
+    flag = "  ⚠ OUTLIER (z will be withheld)" if r[7] else ""
+    print(f"  {r[0]}: MSP={r[1]}  p_all={r[2]:.3g}  covered={r[3]}/{r[4]}{flag}")
+print(f"MERGE-upserted {len(out_rows)} sample(s) → {catalog}.{schema}.sample_ancestry ({n_out} flagged outlier)")

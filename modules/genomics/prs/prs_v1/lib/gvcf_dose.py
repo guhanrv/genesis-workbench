@@ -1,7 +1,7 @@
-"""function_prs.gvcf_blocks — gVCF END-block expansion + per-target dose
+"""the reference gVCF-dose module — gVCF END-block expansion + per-target dose
 extraction.
 
-Extracted from :mod:`function_prs.pysam_score` in 2026-05-15. Two layers:
+Adapted from a validated single-node pysam scorer. Two layers:
 
 * Per-target dose primitives — ``_compute_dose_for_target`` and friends —
   decode the right dose from a single VCF/gVCF record + (chrom, pos, ea,
@@ -410,11 +410,20 @@ def _extract_dose_vector(
                 fasta_ref_arr[idx_arr].tobytes().decode("ascii")
             )
 
+        if vcf_chrom not in vf.header.contigs:
+            # Contig genuinely absent from this gVCF's header (rare on autosomes; common for
+            # chrM/X/Y). Legitimately skip — nothing to fetch.
+            continue
         try:
             rec_iter = vf.fetch(vcf_chrom, first_pos - 1, last_pos)
-        except Exception:
-            # Chromosome not in VCF (rare on autosomes; common for chrM/X/Y).
-            continue
+        except (ValueError, OSError) as e:
+            # The contig IS in the header but fetch failed → almost always a missing/corrupt tabix
+            # index (or I/O error), NOT "chromosome absent". Surface it: silently continuing would
+            # drop the whole chromosome and silently undercount coverage for this sample.
+            raise RuntimeError(
+                f"fetch failed for contig {vcf_chrom!r} (present in header) — missing or corrupt "
+                f"index for this gVCF? Original error: {e}"
+            ) from e
 
         # For each record, binary-search the target window that falls inside
         # [rec_start, rec_end]. We don't maintain a one-shot pointer past

@@ -47,7 +47,7 @@ resources:
           default: ${var.pca_reference_dir}/GRCh38_HGDP+1kGP_ALL.pvar.parquet
         - name: panel_psam
           default: ${var.pca_reference_dir}/GRCh38_HGDP+1kGP_ALL.psam
-        - name: king_cutoff                        # empty = use all panel samples (matches function_prs reference)
+        - name: king_cutoff                        # empty = use all panel samples (matches the reference implementation reference)
           default: ""
         - name: panel_version                      # MUST match the curation version the scorer normalizes against
           default: ""

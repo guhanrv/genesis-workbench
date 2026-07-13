@@ -10,7 +10,8 @@
 # MAGIC - **Dry-run by default** (`apply=false`): prints the plan + estimated cost and writes nothing to score.
 # MAGIC - **`max_cells` cap**: refuses to emit a runnable plan larger than the cap unless `apply=true` AND
 # MAGIC   `confirm_large=true`. A stray "score everything" can never fire silently.
-# MAGIC - Idempotent: re-running with no changes yields **0 cells** (proven in the design smoke tests).
+# MAGIC - Idempotent by design: re-running with no changes yields **0 cells** (the null-safe staleness
+# MAGIC   anti-join below). NOTE: not yet covered by an automated test — add a reconcile guard test.
 
 # COMMAND ----------
 

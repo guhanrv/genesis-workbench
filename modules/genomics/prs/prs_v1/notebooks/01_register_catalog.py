@@ -9,7 +9,7 @@
 # MAGIC
 # MAGIC - **weights** are effect-oriented (`variant_id = chr:pos:effect:other`, plain `weight`) — matches
 # MAGIC   the extractor + scorer (`raw = Σ dose·weight`).
-# MAGIC - **panel_ref** is a **curation read** of `reference_distribution` (function_prs's FROZEN HGDP+1kGP
+# MAGIC - **panel_ref** is a **curation read** of `reference_distribution` (the reference implementation's FROZEN HGDP+1kGP
 # MAGIC   per-superpop mean/sd) — no 1000G panel-scoring job needed. `panel_version` = curation `version`.
 # MAGIC - **weight_sha** (sha256 of the scorefile) scopes a restatement to one PGS: re-registering a PGS
 # MAGIC   replaces only its weights and refreshes only its registry/panel rows; the other 100 stay valid.

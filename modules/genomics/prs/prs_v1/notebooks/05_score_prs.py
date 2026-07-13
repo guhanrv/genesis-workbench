@@ -73,7 +73,7 @@ wts = spark.table("pgs_weights").join(F.broadcast(planned_pgs), ["pgs_id", "weig
 
 # Missing-variant handling (pgsc_calc/plink2 semantics):
 #   mean_impute (default): score over EXACTLY the panel-matched variant set (inner-join pgs_panel_afreq),
-#     with missing → 2·AF(effect) from the frozen panel — matching function_prs mean_impute / plink2
+#     with missing → 2·AF(effect) from the frozen panel — matching the reference implementation mean_impute / plink2
 #     --read-freq. Restricting to the panel-matched set is REQUIRED for calibrated z: pgs_panel_ref's
 #     mean/sd are the panel's scores over those same variants, so the member raw must sum the same set
 #     (a member variant the panel never matched has no panel distribution to standardize against). Without
@@ -134,7 +134,12 @@ raw = (raw.join(nvar, "pgs_id", "left")
 
 # COMMAND ----------
 
-anc = spark.table("sample_ancestry").select("sample_id", F.col("most_similar_pop").alias("msp"))
+# is_outlier flags a sample the ancestry classifier couldn't place (out-of-reference / too-low
+# coverage — see 04_build_sample_ancestry). Fall back to False if the column predates this feature.
+_has_outlier = "is_outlier" in spark.table("sample_ancestry").columns
+anc = spark.table("sample_ancestry").select(
+    "sample_id", F.col("most_similar_pop").alias("msp"),
+    (F.col("is_outlier") if _has_outlier else F.lit(False)).alias("is_outlier"))
 ref = spark.table("pgs_panel_ref").select(
     "pgs_id", F.col("superpop").alias("msp"), "panel_version",
     F.col("mean").alias("ref_mean"), F.col("sd").alias("ref_sd"))
@@ -159,7 +164,7 @@ scored = scored.withColumn("percentile_msp", _norm_cdf_pct(F.col("z_msp")))
 # Uses the SAME PGS + the existing pgs_panel_ref (per-superpop mean/sd), so it needs no bespoke
 # per-ancestry PGS catalog. For a non-admixed sample (RF ~1.0 on its MSP) it collapses to z_msp;
 # for an admixed sample it blends the superpop references. Degenerate rows (sd=0 / prob=0) drop and
-# the surviving weights renormalize (mass redistribution) — matching function_prs._admixed_score.
+# the surviving weights renormalize (mass redistribution) — matching the reference admixed-score routine.
 # (PRSmix+ with DISTINCT per-ancestry PGS variants + MyOme β/caPRS weighting is a curation-heavy
 #  extension deliberately left out of the core scorer.)
 probs = (spark.table("sample_ancestry")
@@ -178,6 +183,12 @@ adm = (
 )
 scored = (scored.join(adm, ["sample_id", "pgs_id"], "left")
           .withColumn("percentile_admixed", _norm_cdf_pct(F.col("z_admixed"))))
+
+# Withhold calibrated z for flagged outliers: normalizing a sample against a reference panel it does
+# not belong to (or projecting it from near-zero coverage) yields a misleading z. Keep raw_score +
+# coverage (still meaningful); null the z/percentile columns. `is_outlier` rides in `scored` from anc.
+for _zc in ("z_msp", "percentile_msp", "z_admixed", "percentile_admixed"):
+    scored = scored.withColumn(_zc, F.when(~F.col("is_outlier"), F.col(_zc)))
 
 # registry metadata + result columns (clinical/concordance left null here — later stages fill them)
 reg = spark.table("pgs_registry").select("pgs_id", "score_id", "disease", "direction", "hr_per_sd", "clinical_model")

@@ -37,7 +37,10 @@ print(f"Glow wheel: {glow_whl_path}")
 
 # COMMAND ----------
 
-# MAGIC %pip install {glow_whl_path} --force-reinstall
+# MAGIC # No --force-reinstall: it reinstalls glow's unpinned deps and can drag pandas up to 3.0,
+# MAGIC # which breaks glow (empty-label reshape crash in the GWAS path; degraded behavior elsewhere).
+# MAGIC # Stock DBR pandas works; glow's other deps still install since they're absent from the base image.
+# MAGIC %pip install {glow_whl_path}
 # MAGIC dbutils.library.restartPython()
 
 # COMMAND ----------

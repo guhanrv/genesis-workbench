@@ -102,8 +102,8 @@ def weights_rows(pgs_id: str, scorefile_rows, weight_sha: str, drop_palindromic:
 
     ``drop_palindromic`` (default True): skip A/T and C/G SNPs — they're strand-ambiguous, so a
     gVCF-extracted dose can silently be for the wrong strand. This matches pgsc_calc/plink2 (and
-    function_prs) drop-mode. Parity-validated: dropping them makes this pipeline's raw score match
-    function_prs to machine epsilon on PGS000004 (the 31 palindromic vars there flip the sign).
+    the reference implementation) drop-mode. Parity-validated: dropping them makes this pipeline's raw score match
+    the reference implementation to machine epsilon on PGS000004 (the 31 palindromic vars there flip the sign).
     """
     acc: dict[str, dict] = {}
     for chrom, pos, effect, other, w in scorefile_rows:

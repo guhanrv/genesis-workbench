@@ -9,7 +9,7 @@
 # Fields per score:
 #   pgs_id / id / disease  — PGS Catalog id + human labels (pgs_registry).
 #   scoring_file           — harmonized PGS-catalog scorefile name in `scorefile_dir` (GRCh38 hmPOS).
-#   reference_distribution — function_prs's FROZEN HGDP+1kGP per-superpop {mean, sd}, built via the
+#   reference_distribution — the reference implementation's FROZEN HGDP+1kGP per-superpop {mean, sd}, built via the
 #                            validated plink2 panel-scoring path. Populates pgs_panel_ref; the scorer
 #                            standardizes raw → z_msp/z_admixed against it.
 #     KEYS MUST BE THE PANEL SUPERPOP CODES (AFR/AMR/CSA/EAS/EUR/MID) — they join by equality to the
@@ -24,7 +24,7 @@ scores:
     id: PGS000004
     disease: Breast cancer
     scoring_file: PGS000004_hmPOS_GRCh38.txt.gz
-    reference_distribution:   # validated via function_prs.reference.score_reference_panel (n=3942)
+    reference_distribution:   # validated via a validated reference-panel scorer (n=3942)
       AFR: {mean: 0.63957070, sd: 0.53728022}
       AMR: {mean: 0.42625768, sd: 0.64233228}
       CSA: {mean: 0.20339816, sd: 0.60054635}

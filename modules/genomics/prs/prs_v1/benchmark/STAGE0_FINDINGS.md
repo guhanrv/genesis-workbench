@@ -109,9 +109,9 @@ in ~27s single-node and onboards a member in ~15s, no spill. The "big leagues" c
 matter) is beyond 128M compressible rows — reachable only with the full multi-PGS union (tens of millions
 of loci) and/or thousands of samples; that rung is a further gated step.
 
-## REAL extraction at scale (6 consented member WGS gVCFs)
+## Real-scale extraction (6 WGS gVCFs, ~200–300 MB each)
 
-The pivot from synthetic scoring to the real cost driver. Ran the actual pysam extraction on 6 real
+The pivot from synthetic scoring to the real cost driver. Ran the actual pysam extraction on 6 real-scale
 WGS gVCFs (~200–300 MB each, on a UC Volume) against a genome-wide 1M-locus catalog, single-node
 8-core. (Extraction walk is gVCF-READ-bound — measured locally: walk@100k=37s vs walk@1M=42s — so a
 1M-locus catalog is representative of full genome-wide extraction *time*.)

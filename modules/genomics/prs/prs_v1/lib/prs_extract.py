@@ -3,7 +3,7 @@
 The gVCF kernel (``gvcf_dose``) extracts the dose of a catalog row's ``effect``
 allele. We store dose **oriented to the effect allele** per ``(chrom,pos,effect,other)``
 variant, and each PGS weight is plain (``raw = Σ dose·weight``) — matching
-function_prs's USER-side scoring exactly.
+the reference implementation's USER-side scoring exactly.
 
 Why not a single canonical dose + signed-weight/offset (the panel-scorer trick)?
 Because the gVCF kernel returns dose 0 for a REF block whose FASTA base is *neither*
@@ -18,7 +18,7 @@ Dedup is by ``(chrom,pos,effect,other)``: PGS that count the same allele at a
 position share a stored dose; the rare cross-PGS opposite-orientation case stores
 both — correct, and still near the ~19M-variant union in practice.
 
-Dense fill matches function_prs's three-way rule (score_kernel.py:198-244):
+Dense fill matches the reference implementation's three-way rule:
 real dose kept; covered-but-no-informative-dose → 0 (confirmed zero); truly-missing
 → 2·AF(effect) (mean-impute vs panel afreq).
 """
@@ -63,7 +63,7 @@ def build_union_catalog(rows) -> UnionCatalog:
 
 
 def dense_fill(dose: np.ndarray, had_record: np.ndarray, af_effect) -> np.ndarray:
-    """function_prs three-way fill → a dense dose vector (no NaN).
+    """the reference implementation three-way fill → a dense dose vector (no NaN).
     real dose kept · (nan & had_record) → 0 · (nan & not had_record) → 2·AF(effect)."""
     out = dose.astype(np.float64).copy()
     nan = np.isnan(out)
@@ -121,7 +121,7 @@ def sample_dosage_rows(vcf_path, ucat, fasta_ref_arr, kernel):
     dose → 0. Truly-missing variants are **omitted**, so the scorer's inner-join sum
     treats them as 0 (``af=0`` fill) and ``n_variants_matched`` reflects true coverage.
 
-    (This is the one deviation from function_prs, which mean-imputes missing → 2·AF.
+    (This is the one deviation from the reference implementation, which mean-imputes missing → 2·AF.
     For high-coverage WGS gVCF, missing is rare and the difference is negligible;
     validated on real data. A 2·AF path needs a panel-AF store — a documented refinement.)
 

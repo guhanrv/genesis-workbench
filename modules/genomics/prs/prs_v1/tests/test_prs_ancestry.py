@@ -1,5 +1,5 @@
 """Unit tests for the ancestry math in ``lib/prs_ancestry.py`` and the
-``z_admixed`` combiner in ``notebooks/01_score_prs.py``.
+``z_admixed`` combiner in ``notebooks/05_score_prs.py``.
 
 No Spark/Databricks needed: ``prs_ancestry`` is a plain importable module (the
 distributed notebook only wraps ``project_member`` in ``applyInPandas``), so we
@@ -131,6 +131,28 @@ def test_z_admixed_drops_degenerate_and_renormalizes():
     raw = 0.34
     z_eur = (raw - _PANEL["EUR"][0]) / _PANEL["EUR"][1]
     assert abs(_z_admixed(raw, _PANEL, {"EUR": 0.5, "MID": 0.5}) - z_eur) < 1e-12
+
+
+def test_mahalanobis_uses_npcs_dof_and_flags_outliers():
+    """Regression: Mahalanobis p must use df = n_pcs (was n_pcs-1, which inflated it and hid
+    outliers), and a sample belonging to no reference population must get a much smaller p_all
+    than an in-population one — the signal the ancestry-abstain gate keys on."""
+    pytest.importorskip("sklearn")
+    pytest.importorskip("scipy")
+    from scipy.stats import chi2
+    X, labels, af, pops, rng = _synth_panel(seed=7)
+    basis = anc.fit_panel_basis(X.copy(), dim_ref=6)
+    n_pcs = 5
+    xu_in = rng.binomial(2, af["EUR"]).astype(np.float32)
+    res_in = anc.classify_ancestry(basis["pcs_ref"], labels.tolist(),
+                                   anc.project_member(basis, xu_in), n_pcs=n_pcs)
+    # p_all must equal chi2.sf(d2, df=n_pcs) — fails if df regresses to n_pcs-1
+    assert abs(res_in["mahalanobis_p_all"] - float(chi2.sf(res_in["mahalanobis_d2"], n_pcs))) < 1e-9
+    # a pure-noise sample (no reference population) is a PC-space outlier → smaller p_all
+    xu_out = rng.uniform(0, 2, X.shape[0]).astype(np.float32)
+    res_out = anc.classify_ancestry(basis["pcs_ref"], labels.tolist(),
+                                    anc.project_member(basis, xu_out), n_pcs=n_pcs)
+    assert res_out["mahalanobis_p_all"] < res_in["mahalanobis_p_all"]
 
 
 if __name__ == "__main__":

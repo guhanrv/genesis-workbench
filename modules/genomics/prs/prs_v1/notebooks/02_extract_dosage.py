@@ -32,6 +32,9 @@ dbutils.widgets.text("fasta_ref_cache_dir", "", "Volume dir to cache the FASTA-r
 dbutils.widgets.text("pgs_ids", "", "Restrict union to these PGS' variants (comma-sep; empty = all registered)")
 dbutils.widgets.text("reextract", "false", "true = re-extract samples already in dosage (needed after add-PGS)")
 dbutils.widgets.text("shard_by_chrom", "true", "Shard extraction per chrom — bounds driver memory to one chrom's catalog")
+dbutils.widgets.text("expected_build", "GRCh38", "Genome build enforced from gVCF chr1 contig length (GRCh38 | GRCh37 | '' to skip)")
+dbutils.widgets.text("min_gvcf_bytes", "10000000", "Fail-fast if a gVCF is smaller than this (guards truncated / SNV-subset / CNV files)")
+dbutils.widgets.text("min_coverage_frac", "0.5", "After extraction, fail if any sample covers < this fraction of the union (guards garbage input)")
 
 catalog = dbutils.widgets.get("catalog")
 schema = dbutils.widgets.get("schema")
@@ -63,6 +66,10 @@ fasta_ref_cache_dir = dbutils.widgets.get("fasta_ref_cache_dir").strip()
 pgs_filter = [x.strip() for x in dbutils.widgets.get("pgs_ids").split(",") if x.strip()]
 reextract = dbutils.widgets.get("reextract").strip().lower() == "true"
 shard_by_chrom = dbutils.widgets.get("shard_by_chrom").strip().lower() == "true"
+expected_build = dbutils.widgets.get("expected_build").strip()
+min_gvcf_bytes = int(dbutils.widgets.get("min_gvcf_bytes"))
+min_coverage_frac = float(dbutils.widgets.get("min_coverage_frac"))
+_CHR1_LEN = {"GRCh38": 248_956_422, "GRCh37": 249_250_621}  # chr1 length disambiguates the build
 
 spark.sql(f"USE CATALOG {catalog}")
 spark.sql(f"USE SCHEMA {schema}")
@@ -89,12 +96,34 @@ if vcf_paths_arg.strip():
 else:
     paths = sorted(glob.glob(os.path.join(vcf_dir, "*.vcf.gz")) + glob.glob(os.path.join(vcf_dir, "*.g.vcf.gz")))
 
+def _validate_gvcf(p, vf):
+    """Fail-fast on inputs that would silently score wrong: a truncated / SNV-subset / CNV file
+    (tiny size), a multi-sample or sites-only file, or the wrong genome build. Without this a 28 KB
+    subset produces near-zero coverage and a plausible-looking low score with no error."""
+    sz = os.path.getsize(p)
+    if sz < min_gvcf_bytes:
+        raise ValueError(f"{p}: {sz} bytes < min_gvcf_bytes={min_gvcf_bytes}. Looks truncated or a "
+                         f"variant subset, not a whole-genome gVCF. Set min_gvcf_bytes lower to override.")
+    samples = list(vf.header.samples)
+    if len(samples) != 1:
+        raise ValueError(f"{p}: expected exactly one sample, found {len(samples)} ({samples[:3]}...). "
+                         f"gVCFs here must be single-sample.")
+    if expected_build:
+        want = _CHR1_LEN.get(expected_build)
+        ctg = vf.header.contigs.get("chr1") or vf.header.contigs.get("1")
+        got = getattr(ctg, "length", None) if ctg else None
+        if want and got and got != want:
+            other = next((b for b, L in _CHR1_LEN.items() if L == got), "unknown")
+            raise ValueError(f"{p}: chr1 length {got} != {expected_build} ({want}); looks like {other}. "
+                             f"Scorefiles are {expected_build}-harmonized — mixing builds mis-scores silently.")
+    return samples[0]
+
 manifest = []
 for p in paths:
     with pysam.VariantFile(p) as vf:
-        sid = list(vf.header.samples)[0]
+        sid = _validate_gvcf(p, vf)
     manifest.append((sid, p))
-print(f"{len(manifest)} gVCF(s) found")
+print(f"{len(manifest)} gVCF(s) found and validated (size/single-sample/build)")
 
 if not reextract and spark.catalog.tableExists("dosage"):
     have = {r["sample_id"] for r in spark.table("dosage").select("sample_id").distinct().collect()}
@@ -242,3 +271,27 @@ stage = spark.table("_dosage_stage")
 n_rows = spark.table("dosage").count()
 n_s = spark.table("dosage").select("sample_id").distinct().count()
 print(f"dosage: {n_rows:,} rows across {n_s} sample(s)")
+
+# COMMAND ----------
+
+# Coverage floor — the definitive garbage-in guard. A truncated / subset / wrong-build gVCF that slips
+# past the manifest checks still lands here as near-zero covered variants; scoring it would emit a
+# plausible low score with no error. Fail loudly instead. (Covered = dosage rows for the sample; a real
+# WGS gVCF covers most of the union, low-coverage cohorts should lower min_coverage_frac deliberately.)
+n_union = uv_all.count()
+_extracted_sids = [s for (s, _) in manifest]
+cov = {r["sample_id"]: r["c"] for r in
+       (spark.table("dosage").where(F.col("sample_id").isin(_extracted_sids))
+        .groupBy("sample_id").agg(F.count(F.lit(1)).alias("c")).collect())}
+_bad = []
+for sid in _extracted_sids:
+    frac = cov.get(sid, 0) / n_union if n_union else 0.0
+    tag = "  ⚠ BELOW FLOOR" if frac < min_coverage_frac else ""
+    print(f"  {sid}: covered {cov.get(sid,0):,}/{n_union:,} = {frac:.1%}{tag}")
+    if frac < min_coverage_frac:
+        _bad.append((sid, frac))
+if _bad:
+    raise ValueError(
+        f"{len(_bad)} sample(s) below min_coverage_frac={min_coverage_frac:.0%}: "
+        f"{[(s, round(f,3)) for s,f in _bad]}. Likely truncated / subset / wrong-build gVCFs. "
+        f"Fix or exclude them, or lower min_coverage_frac for a genuinely low-coverage cohort.")

@@ -177,7 +177,7 @@ No spill.
 
 ### EXTRACTION at scale — 6 real gVCFs → 256 DISTINCT cold files (`prs_extract_bench` run)
 
-The dominant cost driver, previously only at N=6. Replicated the 6 real member gVCFs to **256 distinct
+The dominant cost driver, previously only at N=6. Replicated 6 real-scale WGS gVCFs to **256 distinct
 physical files (72.4 GB > 64 GB node RAM → every read cold, no page-cache cheat)**, ran the REAL kernel
 (`gvcf_dose`+`prs_extract`, sample-mode whole-genome walk, 1 task/file) on a single 8-core node against a
 synthetic genome-wide 1M-locus catalog. Copy 136 s; extract 256 = **52.9 min**. Replicas torn down.
