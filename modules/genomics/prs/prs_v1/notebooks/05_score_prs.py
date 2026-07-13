@@ -16,7 +16,11 @@
 
 dbutils.widgets.text("catalog", "genesis_workbench", "Catalog")
 dbutils.widgets.text("schema", "genesis_schema", "Schema")
-dbutils.widgets.text("missing_mode", "drop", "drop = missing→0 (tested default) | mean_impute = missing→2·AF from pgs_panel_afreq")
+# Default mean_impute: pgs_panel_ref (the z reference) is built by ref_00_build_panel_stats under
+# mean-imputation (missing→2·AF), so members MUST be scored the same way or z is miscalibrated (raw
+# and panel_mean would be computed under different missing policies). At WGS coverage the raw-score
+# effect vs drop is negligible. Use drop only for a raw-only run with no panel/z.
+dbutils.widgets.text("missing_mode", "mean_impute", "mean_impute = missing→2·AF from pgs_panel_afreq (matches panel; calibrated z) | drop = missing→0 (raw-only)")
 catalog = dbutils.widgets.get("catalog"); schema = dbutils.widgets.get("schema")
 missing_mode = dbutils.widgets.get("missing_mode").strip().lower()
 
@@ -68,11 +72,15 @@ else:
 wts = spark.table("pgs_weights").join(F.broadcast(planned_pgs), ["pgs_id", "weight_sha"])  # only planned pgs@sha
 
 # Missing-variant handling (pgsc_calc/plink2 semantics):
-#   drop (default): a PGS variant not covered by the sample contributes 0 (inner join). Correct for
-#     high-coverage WGS gVCF where missing is rare; this is the parity-validated path.
-#   mean_impute: missing → 2·AF(effect) from the frozen panel (pgs_panel_afreq), matching function_prs
-#     mean_impute / plink2 --read-freq. Densifies the join (every planned cell × its PGS' variants), so
-#     it's costlier — worth it for hard-called / low-coverage cohorts where missing is common.
+#   mean_impute (default): score over EXACTLY the panel-matched variant set (inner-join pgs_panel_afreq),
+#     with missing → 2·AF(effect) from the frozen panel — matching function_prs mean_impute / plink2
+#     --read-freq. Restricting to the panel-matched set is REQUIRED for calibrated z: pgs_panel_ref's
+#     mean/sd are the panel's scores over those same variants, so the member raw must sum the same set
+#     (a member variant the panel never matched has no panel distribution to standardize against). Without
+#     this restriction the member sums extra variants → raw on a larger scale → z inflated (seen as
+#     |z|>5 on PGS whose off-panel variants carry heavy weight). Densifies (cell × panel-matched variants).
+#   drop: a PGS variant not covered by the sample contributes 0 (inner join on dose). Parity path for
+#     raw-only runs with no panel/z; not calibrated against pgs_panel_ref.
 _use_impute = missing_mode == "mean_impute" and spark.catalog.tableExists("pgs_panel_afreq")
 if missing_mode == "mean_impute" and not _use_impute:
     print("WARN: missing_mode=mean_impute but pgs_panel_afreq absent → falling back to drop")
@@ -82,9 +90,9 @@ if _use_impute:
     dose_sv = dose.select("sample_id", "variant_id", F.col("dose").alias("_d"))
     agg = (
         plan.join(wts, ["pgs_id", "weight_sha"])                       # densify: cell × PGS' variants
-        .join(afreq, "variant_id", "left")
+        .join(afreq, "variant_id", "inner")                            # RESTRICT to the panel-matched set (= panel scope)
         .join(dose_sv, ["sample_id", "variant_id"], "left")
-        .withColumn("dose_f", F.coalesce(F.col("_d"), 2.0 * F.col("af_effect"), F.lit(0.0)))  # missing→2·AF (→0 if no panel AF)
+        .withColumn("dose_f", F.coalesce(F.col("_d"), 2.0 * F.col("af_effect")))  # covered→real dose; missing→2·AF(panel)
         .groupBy("sample_id", "pgs_id", "weight_sha")
         .agg(F.sum(F.col("dose_f") * F.col("weight")).alias("raw_score"),
              F.sum(F.col("_d").isNotNull().cast("int")).alias("n_variants_matched"))  # matched = real coverage
