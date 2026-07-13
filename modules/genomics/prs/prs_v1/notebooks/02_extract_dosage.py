@@ -41,7 +41,7 @@ schema = dbutils.widgets.get("schema")
 
 # COMMAND ----------
 
-# MAGIC %pip install pysam
+# MAGIC %pip install pysam==0.22.1
 # MAGIC dbutils.library.restartPython()
 
 # COMMAND ----------

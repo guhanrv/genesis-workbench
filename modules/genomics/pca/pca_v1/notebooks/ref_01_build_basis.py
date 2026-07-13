@@ -45,7 +45,7 @@ dbutils.widgets.text("panel_version", "pgsc_HGDP+1kGP_v2_nohwe", "Basis provenan
 
 # COMMAND ----------
 
-# MAGIC %pip install pgenlib zstandard
+# MAGIC %pip install pgenlib==0.94.1 zstandard==0.23.0
 # MAGIC dbutils.library.restartPython()
 
 # COMMAND ----------

@@ -36,7 +36,7 @@ dbutils.widgets.text("block_size", "20000", "pgenlib variants per read task")
 catalog = dbutils.widgets.get("catalog"); schema = dbutils.widgets.get("schema")
 
 # COMMAND ----------
-# MAGIC %pip install pgenlib
+# MAGIC %pip install pgenlib==0.94.1
 # MAGIC dbutils.library.restartPython()
 
 # COMMAND ----------

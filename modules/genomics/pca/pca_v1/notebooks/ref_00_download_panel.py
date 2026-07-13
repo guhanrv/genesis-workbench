@@ -17,7 +17,7 @@ dbutils.widgets.text("dest_volume_dir", "", "Volume dir to stage the panel into"
 dbutils.widgets.text("url", "https://ftp.ebi.ac.uk/pub/databases/spot/pgs/resources/pgsc_HGDP+1kGP_v1.tar.zst", "Panel tar.zst URL")
 
 # COMMAND ----------
-# MAGIC %pip install zstandard
+# MAGIC %pip install zstandard==0.23.0
 # MAGIC dbutils.library.restartPython()
 
 # COMMAND ----------

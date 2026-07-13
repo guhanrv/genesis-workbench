@@ -18,7 +18,7 @@
 
 # COMMAND ----------
 
-# MAGIC %pip install pyyaml
+# MAGIC %pip install pyyaml==6.0.1
 
 # COMMAND ----------
 

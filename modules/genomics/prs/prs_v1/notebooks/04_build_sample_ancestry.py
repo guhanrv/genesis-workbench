@@ -39,7 +39,10 @@ schema = dbutils.widgets.get("schema")
 
 # COMMAND ----------
 
-# MAGIC %pip install pysam scikit-learn scipy
+# MAGIC # Pinned for reproducibility: scikit-learn/scipy are the DBR 15.4 LTS versions (RF ancestry +
+# MAGIC # Mahalanobis must not drift across releases even at fixed random_state); pysam pinned so
+# MAGIC # record.alts/.stop semantics the dose kernel relies on stay fixed.
+# MAGIC %pip install pysam==0.22.1 scikit-learn==1.3.0 scipy==1.11.1
 # MAGIC dbutils.library.restartPython()
 
 # COMMAND ----------
@@ -273,6 +276,17 @@ from scipy.stats import chi2
 N_PCS = 5  # pgsc_calc classifies on 5 PCs
 clf, cov = anc.fit_rf(pcs_ref, superpops, n_pcs=N_PCS)   # once, on the driver
 
+# Provenance: RF/Mahalanobis results depend on the sklearn/scipy versions, so record the versions the
+# classification actually ran under (pins live in the %pip cell; this captures what truly loaded).
+def _ver(mod):
+    try:
+        return __import__(mod).__version__
+    except Exception:
+        return "unknown"
+_lib_versions = json.dumps({"scikit-learn": _ver("sklearn"), "scipy": _ver("scipy"),
+                            "pysam": _ver("pysam"), "numpy": _ver("numpy")})
+print("classifier lib versions:", _lib_versions)
+
 # is_outlier gate: RF argmax ALWAYS returns a superpop, even for a sample that belongs to no
 # reference population (non-human/contaminated, an ancestry absent from HGDP+1kGP) or that covers
 # almost no basis loci (projects to ~origin). Flag those so the scorer refuses to report a calibrated
@@ -290,7 +304,7 @@ for r in proj_rows:
     is_outlier = bool(p_all < outlier_alpha or cov_frac < min_coverage_frac)
     rf_probs = {str(c): float(p) for c, p in zip(clf.classes_, probs)}
     out_rows.append((r["sample_id"], msp, p_all, int(r["n_covered"]), n_loci,
-                     panel_version, json.dumps(rf_probs), is_outlier))
+                     panel_version, json.dumps(rf_probs), is_outlier, _lib_versions))
 
 OUT_SCHEMA = StructType([
     StructField("sample_id", StringType()),
@@ -301,6 +315,7 @@ OUT_SCHEMA = StructType([
     StructField("panel_version", StringType()),
     StructField("rf_probs", StringType()),
     StructField("is_outlier", BooleanType()),
+    StructField("lib_versions", StringType()),
 ])
 out = (spark.createDataFrame(out_rows, OUT_SCHEMA)
        .withColumn("computed_at", F.current_timestamp()))
@@ -309,7 +324,7 @@ spark.sql("""
 CREATE TABLE IF NOT EXISTS sample_ancestry (
   sample_id STRING, most_similar_pop STRING, mahalanobis_p_all DOUBLE,
   n_loci_covered BIGINT, n_loci_basis BIGINT, panel_version STRING,
-  rf_probs STRING, is_outlier BOOLEAN, computed_at TIMESTAMP
+  rf_probs STRING, is_outlier BOOLEAN, lib_versions STRING, computed_at TIMESTAMP
 ) USING DELTA
 """)
 # tolerate a pre-existing table created before is_outlier was added

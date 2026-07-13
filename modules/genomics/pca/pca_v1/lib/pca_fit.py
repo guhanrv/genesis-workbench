@@ -14,9 +14,12 @@ produce the QC'd dose table (the source-specific adapter):
   - ``ref_01_build_basis`` — pgenlib read of the frozen HGDP+1kGP panel (labeled),
   - ``01_compute_pca``          — Glow-ingested cohort dosage (in-cohort, unlabeled).
 
-The fit is verbatim the FRAPOSA ``lib/prs_ancestry.fit_panel_basis`` used by prs to
-project members, so a basis built here is byte-identical to the validated science and
-prs's projection/classification is unchanged.
+The fit mirrors the FRAPOSA ``lib/prs_ancestry.fit_panel_basis`` used by prs to project
+members, so prs's projection/classification stays consistent with the basis. NOTE: the
+result is NOT byte-identical to the historical plink2-based basis — the LD-prune here is a
+Spark windowed-r² greedy prune, not plink2 ``--indep-pairwise``, so it can keep a different
+tag-SNP set. Eigenvector signs are canonicalized (``_canonicalize_signs``) so a rebuild is
+reproducible; a golden-vector parity test against the reference basis is not yet committed.
 
 Scale note: the fit collects the pruned matrix (n_var × n_samples) to the driver for the
 BLAS ``eigh`` — fine at reference/cohort scale (samples² tractable, the same regime
@@ -194,9 +197,30 @@ def fit_pca_model(
             "panel_version": panel_version, "out_path": out_path, "backend": backend}
 
 
+def _canonicalize_signs(V_on, pcs_ref, U_on):
+    """Fix the arbitrary per-component sign of the decomposition so the basis is REPRODUCIBLE across
+    rebuilds / LAPACK-BLAS builds. eigh/svd only determine each eigenvector up to sign; without a
+    convention a rebuilt basis can flip PC signs (and, in a near-degenerate block, the classifier's
+    PC4/PC5 rotate). Convention: make each component's largest-|value| sample-space entry positive.
+    V_on / pcs_ref / U_on are column-aligned per component, so flipping a component in all three
+    together preserves the fit exactly (scores↔loadings stay mutually consistent) while pinning the
+    sign. NOTE: this does NOT make backends bit-identical to each other or to the historical basis —
+    it only makes each backend deterministic run-to-run. Rebuild the stored basis to adopt it."""
+    import numpy as _np
+    k = V_on.shape[1]
+    idx = _np.argmax(_np.abs(V_on), axis=0)
+    signs = _np.sign(V_on[idx, _np.arange(k)])
+    signs[signs == 0] = 1.0
+    V_on = V_on * signs
+    U_on = U_on * signs
+    pcs_ref = pcs_ref * signs[:pcs_ref.shape[1]]
+    return V_on, pcs_ref, U_on
+
+
 def _fit_driver(kept_dose, order_by_vidx, n_var, dim_ref, dim_online):
-    """Collect the pruned matrix to the driver → BLAS XᵀX → eigh → loadings. Verbatim FRAPOSA
-    (byte-identical to the validated basis). Requires driver.maxResultSize ≥ ~4g for the collect."""
+    """Collect the pruned matrix to the driver → BLAS XᵀX → eigh → loadings. FRAPOSA-equivalent fit.
+    Requires driver.maxResultSize ≥ ~4g for the collect. Eigenvector signs are canonicalized (see
+    _canonicalize_signs) so the basis is reproducible across rebuilds."""
     kept_rows = kept_dose.collect()
     vidx_arr = np.fromiter((r["vidx"] for r in kept_rows), np.int64, len(kept_rows))
     X = np.stack([np.asarray(r["dose"], dtype=np.float32) for r in kept_rows])   # (n_var, n_samples), NaN=missing
@@ -223,6 +247,7 @@ def _fit_driver(kept_dose, order_by_vidx, n_var, dim_ref, dim_online):
     s_on = s_all[:dim_online]; V_on = V_all[:, :dim_online]          # (n_panel × dim_online)
     pcs_ref = V_all[:, :dim_ref] * s_all[:dim_ref]                   # (n_panel × dim_ref)
     U_on = (X @ (V_on / s_on)).astype(np.float64)                    # (n_var × dim_online)
+    V_on, pcs_ref, U_on = _canonicalize_signs(V_on, pcs_ref, U_on)
     print(f"eigendecomposition (driver): top s = {np.round(s_on[:dim_ref], 1)}")
     return mean, std, s_on, V_on, pcs_ref, U_on
 
@@ -264,6 +289,7 @@ def _fit_distributed(spark, kept_dose, order_by_vidx, n_var, n_panel, dim_ref, d
     for vidx, m, s, u in triples:                      # reassemble in stable (chrom, pos) order
         i = order_by_vidx[int(vidx)]
         mean[i, 0] = m; std[i, 0] = s; U_on[i, :] = np.asarray(u)
+    V_on, pcs_ref, U_on = _canonicalize_signs(V_on, pcs_ref, U_on)
     print(f"eigendecomposition (distributed Gram): top s = {np.round(s_on[:dim_ref], 1)}")
     return mean, std, s_on, V_on, pcs_ref, U_on
 
@@ -332,5 +358,6 @@ def _fit_randomized(spark, kept_dose, order_by_vidx, n_var, n_panel, dim_ref, di
     s_on = s_all[:dim_online]; V_on = V_all[:, :dim_online]
     pcs_ref = V_all[:, :dim_ref] * s_all[:dim_ref]
     U_on = Ub[:, :dim_online]
+    V_on, pcs_ref, U_on = _canonicalize_signs(V_on, pcs_ref, U_on)
     print(f"randomized SVD (ℓ={ell}, q={n_power_iter}): top s = {np.round(s_on[:dim_ref], 1)}")
     return mean, std, s_on, V_on, pcs_ref, U_on
