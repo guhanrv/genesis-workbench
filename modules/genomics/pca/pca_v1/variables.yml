@@ -56,3 +56,30 @@ variables:
       ref_01_build_basis. The one projectable model prs projects members onto for ancestry
       classification (and the reference PCs for the RF). Ancestry analogue of a saved ML model.
     default: /Volumes/${var.core_catalog_name}/${var.core_schema_name}/pca_reference/pca_basis.npz
+
+  ancestry_pca_model_name:
+    description: >-
+      UC model name (within core_catalog.core_schema) of the ancestry_pca pyfunc. Built by
+      ref_01_build_basis alongside pca_basis.npz. PRS loads @champion when present.
+    default: ancestry_pca
+
+  ancestry_classifier_model_name:
+    description: >-
+      UC model name of the ancestry_classifier pyfunc (PCs → MSP / rf_probs / is_outlier).
+    default: ancestry_classifier
+
+  module_registration_experiment_name:
+    description: MLflow experiment tag the module logs the registered models under.
+    default: dbx_genesis_workbench_modules
+
+  databricks_app_names:
+    description: >-
+      Colon-separated app names whose service principals get run-permission grants on this
+      module's jobs. Override in module.env when core used a non-default app_name.
+    default: genesis-workbench:mcp-genesis-workbench
+
+  app_sp_client_id:
+    description: >-
+      UI app service-principal client id, granted CAN_MANAGE_RUN on pca_reference_setup.
+      Resolved by modules/genomics/deploy.sh. Empty = no SP grant (first install, no app yet).
+    default: ""

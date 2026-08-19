@@ -44,8 +44,9 @@ Six tasks, all on **classic** job clusters (fixed `num_workers`, started minimal
 **never serverless** — its unbounded autoscale is the #1 bill risk). Ephemeral (auto-terminate).
 
 ```
-setup_stores → register → extract_dosage → reconcile ──────────┐
-                                        └→ build_sample_ancestry ┴→ score_prs → save_results → mark_success/failure
+setup_stores → register → extract_dosage → build_sample_ancestry
+                                      └→ optional synthetic manifest fan-out
+                                                   └→ reconcile → score_prs → save_results → mark_success/failure
 ```
 
 - **`00_setup_stores`** — idempotent DDL for the stores above.
@@ -53,7 +54,11 @@ setup_stores → register → extract_dosage → reconcile ───────
 - **`02_extract_dosage`** — per-sample **gVCF** → `dosage`, one Spark task per (sample × chrom). Uses the ported pysam **END-block + FASTA** kernel (`lib/gvcf_dose.py`): plink2 and Glow both drop gVCF `END=` REF blocks (~70% coverage loss), so this can't be Glow/SQL. Incremental: skips samples already extracted. *(Non-gVCF cohorts use the sibling engine `00_ingest_vcf` — Glow `DS/HDS/GT`, imputed-dosage or regular hard-called VCF — which orients + MERGEs into the SAME `dosage` store, so everything downstream is identical.)*
 - **`03_reconcile`** — the incremental brain + cost kill-switch. Anti-joins the desired `(sample × pgs)` grid vs `prs_scores` → emits **only missing/stale cells**. **Dry-run by default** (`apply=false`): prints the cell count + estimated cost and scores nothing; a plan larger than `max_cells` additionally needs `confirm_large=true`. A stray run can never fire the full grid.
 - **`04_build_sample_ancestry`** — OADP-projects each sample onto the frozen FRAPOSA PCA basis (`lib/prs_ancestry.py`) → RF most-similar-pop → `sample_ancestry`. Extraction distributed like `extract_dosage`; RF classify on the driver.
-- **`05_score_prs`** — SQL join-aggregate over the reconcile plan → `raw`, then reference-panel `z_msp` + RF-posterior-weighted `z_admixed` → MERGE `prs_scores`. Default `missing_mode=drop`; `mean_impute` uses `pgs_panel_afreq` (2·AF).
+- **`materialize_scale_manifest`** — disabled unless `sample_manifest_path` is supplied and
+  `confirm_synthetic_fanout=true`. Extracts each canonical gVCF once, then uses bounded Spark
+  batches to copy canonical dosage/ancestry rows to synthetic logical IDs. This measures Delta,
+  reconcile, and scoring scale without creating duplicate gVCFs or rereading one file N times.
+- **`05_score_prs`** — SQL join-aggregate over the reconcile plan → `raw`, then reference-panel `z_msp` + RF-posterior-weighted `z_admixed` → MERGE `prs_scores`. Default `missing_mode=mean_impute` (`pgs_panel_afreq` 2·AF). Optional PGS-axis chunking is off by default (n=10 A/B: 3M budget was 4.4× slower).
 - **`06_save_results`** — read `prs_scores` → log cohort summary metrics (coverage, z_msp/z_admixed counts, raw distribution) to the MLflow run. `mark_success` / `mark_failure` then set the run's `job_status` (framework convention).
 
 ## Two ingest engines (both write the shared `dosage` store)
@@ -78,7 +83,10 @@ setup_stores → register → extract_dosage → reconcile ───────
 | `pgs_ids` / `samples` | scope the run to specific scores / samples (empty = all) |
 | `basis_path` | `pca_basis.npz` for ancestry (default `${var.prs_pca_basis}`) |
 | `apply` / `max_cells` / `confirm_large` | reconcile guardrails — **dry-run by default** |
-| `missing_mode` | `drop` (default) or `mean_impute` (2·AF from `pgs_panel_afreq`) |
+| `missing_mode` | `mean_impute` (default; 2·AF from `pgs_panel_afreq`) or `drop` |
+| `pgs_chunk_size` / `max_weight_rows_per_chunk` | bound mean_impute densify; both default `0` (all-at-once). `pgs_chunk_size>0` = fixed PGS/chunk; else a weight-row budget if set |
+| `sample_manifest_path` / `confirm_synthetic_fanout` | synthetic-only sample-axis benchmark; empty/false in production |
+| `fanout_batch_size` / `max_fanout_rows` | bounded fan-out writes and pre-write row-count kill switch |
 
 ## Deploy
 
@@ -94,6 +102,9 @@ wheel, and `settings`). From the repo root:
 - **Incrementality is the cost control.** The full grid is scored once (backfill); thereafter
   reconcile computes only the increment. Guardrails are enforced in code (dry-run default,
   `max_cells` cap), not left to discipline.
+- **A synthetic manifest is not an extraction benchmark.** Many logical IDs can share one
+  canonical gVCF only for scale testing. True production extraction throughput requires distinct
+  physical gVCFs; the manifest rung measures downstream sample cardinality.
 - `variant_id` is orientation-canonical (`chrom:pos:effect:other`) in both `dosage` and
   `pgs_weights`, so the join can't silently miss on strand.
 - **Reference tests** (`tests/`, `python -m pytest`) are dependency-light and run without a

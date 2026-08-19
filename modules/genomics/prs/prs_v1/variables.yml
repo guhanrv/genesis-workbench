@@ -20,6 +20,18 @@ variables:
   cpu_node_type:
     description: Node type for CPU vms
 
+  prs_fanout_node_type:
+    description: >-
+      Standard-memory local-SSD node used only for synthetic manifest fan-out. Defaults to the
+      module CPU node for portability; the GCP target overrides this with c3d-standard-8-lssd.
+    default: ${var.cpu_node_type}
+
+  prs_fanout_num_workers:
+    description: >-
+      Fixed worker count for reproducible, cost-bounded synthetic manifest benchmarks.
+      Do not autoscale: compare 10/1k/10k on the same fleet.
+    default: 4
+
   t4_node_type:
     description: Node type for T4 GPUs
 
@@ -64,7 +76,7 @@ variables:
       Volume dir where incoming gVCFs land. The prs_scoring job's file-arrival trigger monitors it
       and BATCHES arrivals (one run drains all pending gVCFs — ~45x cheaper/member than per-member
       runs, per Stage-0). Also the default vcf_dir for extraction.
-    default: /Volumes/${var.core_catalog_name}/${var.core_schema_name}/prs_data/incoming
+    default: /Volumes/${var.core_catalog_name}/${var.core_schema_name}/prs_data/incoming/
 
   pca_reference_dir:
     description: >-

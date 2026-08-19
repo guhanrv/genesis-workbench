@@ -1,37 +1,47 @@
-"""Shared PCA fit — the pure computation behind both pca_v1 entry points.
+"""Shared PCA fit — the Spark orchestration around the FRAPOSA panel fit.
 
 Given a QC'd per-variant dose table (one row per variant: ``vidx, chrom, pos, ref, alt,
 dose`` where ``dose`` is a float array over samples, NaN = missing), this does the
 cohort-agnostic work: a distributed Hail-style windowed-r² **LD prune**, then a
-driver-side **FRAPOSA fit** (per-variant standardize → samples² Gram ``XᵀX`` → ``eigh`` →
-loadings ``U = X·(V/s)``), and writes ONE projectable model ``pca_basis.npz``
-{loadings U/s/V, per-variant mean/std, loci, reference PC scores ``pcs_ref``, sample ids,
-superpop labels, provenance}. Optionally also materializes the per-sample scores
-(``pcs_ref``) to a Delta table for consumers that just want covariates (GWAS).
+**FRAPOSA fit** (per-variant standardize → samples² Gram ``XᵀX`` → ``eigh`` → loadings
+``U = X·(V/s)``), and writes ONE projectable model ``pca_basis.npz`` {loadings U/s/V,
+per-variant mean/std, loci, reference PC scores ``pcs_ref``, sample ids, superpop labels,
+provenance}. Optionally also materializes the per-sample scores (``pcs_ref``) to a Delta
+table for consumers that just want covariates (GWAS).
 
-Both entry points call this with the SAME contract; they differ only in how they
-produce the QC'd dose table (the source-specific adapter):
+**Third-party code.** The fit math this module delegates to is a DERIVED WORK of FRAPOSA
+(MIT) and pgsc_calc (Apache-2.0). This module contains no copied upstream code itself — the
+copies, the modification notes and the full license texts are in ``lib/fraposa.py``.
+
+**The fit math lives in one place: ``lib/fraposa.py``.** The driver backend here delegates
+its standardize/eigh/loadings/sign-canonicalization to ``fraposa.fit_basis`` (byte-identical
+to the former inline code), and the distributed/randomized backends reuse
+``fraposa.canonicalize_signs``. Only the Spark-specific pieces — the LD-prune and the
+distributed Gram / matrix-free RSVD matvecs — stay in this module, since they never run at
+inference. This collapses the FRAPOSA fit that previously existed in both ``pca_fit`` and
+the fit paths down to the single ``fraposa`` implementation.
+
+Both entry points call this with the SAME contract; they differ only in how they produce
+the QC'd dose table (the source-specific adapter):
   - ``ref_01_build_basis`` — pgenlib read of the frozen HGDP+1kGP panel (labeled),
   - ``01_compute_pca``          — Glow-ingested cohort dosage (in-cohort, unlabeled).
 
-The fit mirrors the FRAPOSA ``lib/prs_ancestry.fit_panel_basis`` used by prs to project
-members, so prs's projection/classification stays consistent with the basis. NOTE: the
-result is NOT byte-identical to the historical plink2-based basis — the LD-prune here is a
-Spark windowed-r² greedy prune, not plink2 ``--indep-pairwise``, so it can keep a different
-tag-SNP set. Eigenvector signs are canonicalized (``_canonicalize_signs``) so a rebuild is
-reproducible; a golden-vector parity test against the reference basis is not yet committed.
+NOTE: the result is NOT byte-identical to the historical plink2-based basis — the LD-prune
+here is a Spark windowed-r² greedy prune, not plink2 ``--indep-pairwise``, so it can keep a
+different tag-SNP set. Eigenvector signs are canonicalized (``fraposa.canonicalize_signs``)
+so a rebuild is reproducible; a golden-vector parity test against the reference basis is not
+yet committed.
 
-Scale note: the fit collects the pruned matrix (n_var × n_samples) to the driver for the
-BLAS ``eigh`` — fine at reference/cohort scale (samples² tractable, the same regime
-``spark.ml.PCA`` assumed), and required to emit projectable variant loadings. A very large
-in-cohort GWAS PCA (many thousands of samples) should run this on a classic driver sized
-like the reference job, or move to a distributed-Gram backend — a documented follow-up,
-not a silent regression.
+Scale note: the driver fit collects the pruned matrix (n_var × n_samples) to the driver for
+the BLAS ``eigh`` — fine at reference/cohort scale (samples² tractable), and required to emit
+projectable variant loadings. Larger cohorts use ``backend="distributed"`` (samples² Gram
+computed distributedly) or ``backend="randomized"`` (matrix-free RSVD, biobank scale).
 """
 from __future__ import annotations
 
 import os
 import shutil
+import sys
 import tempfile
 
 import numpy as np
@@ -39,8 +49,13 @@ import pandas as pd
 import pyspark.sql.functions as F
 from pyspark.sql.types import StructType, StructField, StringType, LongType
 
+# The single FRAPOSA fit implementation (fit_basis + canonicalize_signs). Importable
+# off-cluster; on-cluster it is shipped alongside this module (addPyFile + sys.path).
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+import fraposa
+
 # Version of the pca_basis.npz contract (keys/shapes the model exposes). Bump on any breaking
-# change to the npz schema; downstream consumers (prs 05_build_sample_ancestry) assert
+# change to the npz schema; downstream consumers assert
 # compatibility so a schema drift fails fast at load, not silently mid-run.
 BASIS_SCHEMA_VERSION = "1"
 
@@ -70,8 +85,9 @@ def fit_pca_model(
     may be an empty array for an unlabeled cohort). Returns a small summary dict.
 
     ``backend``:
-      - ``"driver"`` (default) — collect the pruned matrix to the driver, one BLAS ``XᵀX`` + ``eigh``.
-        Byte-identical to the validated FRAPOSA fit; use for the reference basis and cohort scale.
+      - ``"driver"`` (default) — collect the pruned matrix to the driver, one BLAS ``XᵀX`` + ``eigh``
+        (via ``fraposa.fit_basis``). Byte-identical to the validated FRAPOSA fit; use for the
+        reference basis and cohort scale.
       - ``"distributed"`` — compute the samples² Gram distributedly (never collect the full n_var ×
         n_samples matrix), then ``eigh`` the small Gram on the driver and compute loadings
         distributedly. Lifts the *variant*-axis driver-memory ceiling for large in-cohort GWAS PCA.
@@ -89,7 +105,74 @@ def fit_pca_model(
         buy accuracy on the trailing PCs. Approximate top-``dim_online`` PCA, not bit-identical, so the
         reference basis stays on ``"driver"``. (An out-of-core IRAM backend is a further follow-up.)
     """
+    fit = prune_and_fit(
+        spark, qc_df, n_panel=len(sample_ids), dim_ref=dim_ref, r2=r2, window_bp=window_bp,
+        chunk_bp=chunk_bp, backend=backend, rsvd_oversample=rsvd_oversample,
+        rsvd_power_iter=rsvd_power_iter, rsvd_seed=rsvd_seed)
+    kept_pd = fit["kept_pd"]; n_var = fit["n_var"]
+    dim_ref = fit["dim_ref"]; dim_stu = fit["dim_stu"]; dim_online = fit["dim_online"]
+    mean, std = fit["mean"], fit["std"]
+    s_on, V_on, pcs_ref, U_on = fit["s_on"], fit["V_on"], fit["pcs_ref"], fit["U_on"]
     n_panel = len(sample_ids)
+
+    # --- 3. Persist the ONE projectable model (same shape as lib/fraposa.fit_panel_basis) ---
+    local_npz = local_npz or os.path.join(tempfile.gettempdir(), "pca_basis.npz")
+    np.savez(local_npz,
+             loci_chrom=kept_pd["chrom"].astype(str).to_numpy(),
+             loci_pos=kept_pd["pos"].to_numpy(np.int64),
+             loci_ref=kept_pd["ref"].astype(str).to_numpy(),
+             loci_alt=kept_pd["alt"].astype(str).to_numpy(),
+             U_on=U_on, s_on=s_on, V_on=V_on, pcs_ref=pcs_ref, mean=mean, std=std,
+             dim_ref=dim_ref, dim_stu=dim_stu,
+             panel_iids=np.array(sample_ids), superpops=np.asarray(superpops),
+             panel_version=np.array(panel_version),
+             schema_version=np.array(BASIS_SCHEMA_VERSION))
+    shutil.copyfile(local_npz, out_path)                            # out_path is a /Volumes FUSE path
+    print(f"wrote basis → {out_path} | n_loci={n_var} n_panel={n_panel} "
+          f"dim_online={dim_online} panel_version={panel_version}")
+
+    # --- 4. Optional: materialize per-sample scores for covariate consumers (GWAS) ---
+    if scores_table:
+        cols = ["sample_id"] + [f"PC{j + 1}" for j in range(dim_ref)]
+        rows = [(str(sample_ids[i]), *[float(pcs_ref[i, j]) for j in range(dim_ref)]) for i in range(n_panel)]
+        spark.createDataFrame(rows, cols).write.mode("overwrite").option(
+            "overwriteSchema", "true").saveAsTable(scores_table)
+        print(f"wrote scores → {scores_table} ({n_panel} samples × {dim_ref} PCs)")
+
+    # Include the fitted arrays so the reference-basis notebook can ALSO register
+    # ancestry_pca / ancestry_classifier without running prune_and_fit twice.
+    return {"n_var": int(n_var), "n_panel": int(n_panel), "dim_online": int(dim_online),
+            "dim_ref": int(dim_ref), "dim_stu": int(dim_stu),
+            "panel_version": panel_version, "out_path": out_path, "backend": backend,
+            "kept_pd": kept_pd, "mean": mean, "std": std,
+            "s_on": s_on, "V_on": V_on, "pcs_ref": pcs_ref, "U_on": U_on}
+
+
+def prune_and_fit(
+    spark,
+    qc_df,
+    *,
+    n_panel: int,
+    dim_ref: int,
+    r2: float,
+    window_bp: int,
+    chunk_bp: int = 25_000_000,
+    backend: str = "driver",
+    rsvd_oversample: int = 10,
+    rsvd_power_iter: int = 2,
+    rsvd_seed: int = 0,
+):
+    """LD-prune ``qc_df`` → FRAPOSA fit → return the fitted arrays (NO persistence).
+
+    This is the reusable core: the reference-basis notebook calls it directly and logs the
+    result as the ``ancestry_pca`` / ``ancestry_classifier`` MLflow models (§5), while
+    ``fit_pca_model`` wraps it to write the in-cohort ``pca_basis.npz`` (the GWAS-covariate
+    path). ``n_panel`` is the number of dose columns (== len(sample_ids)).
+
+    Returns a dict: ``kept_pd`` (pruned loci: vidx/chrom/pos/ref/alt, in stable order),
+    ``n_var``, ``dim_ref`` / ``dim_stu`` / ``dim_online`` (rank-clamped), and the fitted
+    ``mean`` / ``std`` / ``s_on`` / ``V_on`` / ``pcs_ref`` / ``U_on``. See ``fit_pca_model``
+    for the ``backend`` semantics."""
     # clamp to rank: eigh yields n_panel eigenvectors, and per-variant mean-centering makes the all-ones
     # sample vector an exact null eigenvector (one ~0 eigenvalue) → usable rank ≤ n_panel-1. Capping both
     # dim_ref and dim_online at n_panel-1 keeps dim_ref ≤ dim_online and stops U=X·(V/s) from dividing by
@@ -169,58 +252,17 @@ def fit_pca_model(
     else:
         raise ValueError(f"backend must be 'driver', 'distributed' or 'randomized', got {backend!r}")
 
-    # --- 3. Persist the ONE projectable model (same shape as lib/prs_ancestry.fit_panel_basis) ---
-    local_npz = local_npz or os.path.join(tempfile.gettempdir(), "pca_basis.npz")
-    np.savez(local_npz,
-             loci_chrom=kept_pd["chrom"].astype(str).to_numpy(),
-             loci_pos=kept_pd["pos"].to_numpy(np.int64),
-             loci_ref=kept_pd["ref"].astype(str).to_numpy(),
-             loci_alt=kept_pd["alt"].astype(str).to_numpy(),
-             U_on=U_on, s_on=s_on, V_on=V_on, pcs_ref=pcs_ref, mean=mean, std=std,
-             dim_ref=dim_ref, dim_stu=dim_stu,
-             panel_iids=np.array(sample_ids), superpops=np.asarray(superpops),
-             panel_version=np.array(panel_version),
-             schema_version=np.array(BASIS_SCHEMA_VERSION))
-    shutil.copyfile(local_npz, out_path)                            # out_path is a /Volumes FUSE path
-    print(f"wrote basis → {out_path} | n_loci={n_var} n_panel={n_panel} "
-          f"dim_online={dim_online} panel_version={panel_version}")
-
-    # --- 4. Optional: materialize per-sample scores for covariate consumers (GWAS) ---
-    if scores_table:
-        cols = ["sample_id"] + [f"PC{j + 1}" for j in range(dim_ref)]
-        rows = [(str(sample_ids[i]), *[float(pcs_ref[i, j]) for j in range(dim_ref)]) for i in range(n_panel)]
-        spark.createDataFrame(rows, cols).write.mode("overwrite").option(
-            "overwriteSchema", "true").saveAsTable(scores_table)
-        print(f"wrote scores → {scores_table} ({n_panel} samples × {dim_ref} PCs)")
-
-    return {"n_var": int(n_var), "n_panel": int(n_panel), "dim_online": int(dim_online),
-            "panel_version": panel_version, "out_path": out_path, "backend": backend}
-
-
-def _canonicalize_signs(V_on, pcs_ref, U_on):
-    """Fix the arbitrary per-component sign of the decomposition so the basis is REPRODUCIBLE across
-    rebuilds / LAPACK-BLAS builds. eigh/svd only determine each eigenvector up to sign; without a
-    convention a rebuilt basis can flip PC signs (and, in a near-degenerate block, the classifier's
-    PC4/PC5 rotate). Convention: make each component's largest-|value| sample-space entry positive.
-    V_on / pcs_ref / U_on are column-aligned per component, so flipping a component in all three
-    together preserves the fit exactly (scores↔loadings stay mutually consistent) while pinning the
-    sign. NOTE: this does NOT make backends bit-identical to each other or to the historical basis —
-    it only makes each backend deterministic run-to-run. Rebuild the stored basis to adopt it."""
-    import numpy as _np
-    k = V_on.shape[1]
-    idx = _np.argmax(_np.abs(V_on), axis=0)
-    signs = _np.sign(V_on[idx, _np.arange(k)])
-    signs[signs == 0] = 1.0
-    V_on = V_on * signs
-    U_on = U_on * signs
-    pcs_ref = pcs_ref * signs[:pcs_ref.shape[1]]
-    return V_on, pcs_ref, U_on
+    return {"kept_pd": kept_pd, "n_var": int(n_var),
+            "dim_ref": int(dim_ref), "dim_stu": int(dim_stu), "dim_online": int(dim_online),
+            "mean": mean, "std": std, "s_on": s_on, "V_on": V_on,
+            "pcs_ref": pcs_ref, "U_on": U_on, "backend": backend}
 
 
 def _fit_driver(kept_dose, order_by_vidx, n_var, dim_ref, dim_online):
-    """Collect the pruned matrix to the driver → BLAS XᵀX → eigh → loadings. FRAPOSA-equivalent fit.
-    Requires driver.maxResultSize ≥ ~4g for the collect. Eigenvector signs are canonicalized (see
-    _canonicalize_signs) so the basis is reproducible across rebuilds."""
+    """Collect the pruned matrix to the driver → FRAPOSA fit (``fraposa.fit_basis``). This is
+    the FRAPOSA-equivalent fit; the standardize / Gram ``XᵀX`` / ``eigh`` / loadings /
+    sign-canonicalization all live in ``fraposa``. Requires driver.maxResultSize ≥ ~4g for
+    the collect."""
     kept_rows = kept_dose.collect()
     vidx_arr = np.fromiter((r["vidx"] for r in kept_rows), np.int64, len(kept_rows))
     X = np.stack([np.asarray(r["dose"], dtype=np.float32) for r in kept_rows])   # (n_var, n_samples), NaN=missing
@@ -228,28 +270,9 @@ def _fit_driver(kept_dose, order_by_vidx, n_var, dim_ref, dim_online):
     assert X.shape[0] == n_var, f"collected {X.shape[0]} != pruned {n_var}"
     del kept_rows, vidx_arr
 
-    # FRAPOSA standardize: per-variant mean/std (ddof=0), cast to float32, missing → 0.
-    is_miss = np.isnan(X)
-    mean = np.zeros(n_var, np.float64); std = np.zeros(n_var, np.float64)
-    for i in range(n_var):
-        row = X[i, :][~is_miss[i, :]]
-        if row.size:
-            mean[i] = float(np.mean(row)); std[i] = float(np.std(row))
-    std[std == 0] = 1.0
-    X -= mean.astype(np.float32).reshape(-1, 1)
-    X /= std.astype(np.float32).reshape(-1, 1)
-    X[is_miss] = 0.0
-    mean = mean.reshape(-1, 1); std = std.reshape(-1, 1)
-
-    XTX = (X.T @ X).astype(np.float64)                               # (n_panel × n_panel), single BLAS gemm
-    ssq, V = np.linalg.eigh(XTX)
-    s_all = np.sqrt(np.abs(ssq))[::-1]; V_all = V.T[::-1].T          # descending
-    s_on = s_all[:dim_online]; V_on = V_all[:, :dim_online]          # (n_panel × dim_online)
-    pcs_ref = V_all[:, :dim_ref] * s_all[:dim_ref]                   # (n_panel × dim_ref)
-    U_on = (X @ (V_on / s_on)).astype(np.float64)                    # (n_var × dim_online)
-    V_on, pcs_ref, U_on = _canonicalize_signs(V_on, pcs_ref, U_on)
-    print(f"eigendecomposition (driver): top s = {np.round(s_on[:dim_ref], 1)}")
-    return mean, std, s_on, V_on, pcs_ref, U_on
+    b = fraposa.fit_basis(X, dim_ref=dim_ref, dim_online=dim_online, canonicalize=True)
+    print(f"eigendecomposition (driver): top s = {np.round(b['s_on'][:dim_ref], 1)}")
+    return b["mean"], b["std"], b["s_on"], b["V_on"], b["pcs_ref"], b["U_on"]
 
 
 def _fit_distributed(spark, kept_dose, order_by_vidx, n_var, n_panel, dim_ref, dim_online):
@@ -289,7 +312,7 @@ def _fit_distributed(spark, kept_dose, order_by_vidx, n_var, n_panel, dim_ref, d
     for vidx, m, s, u in triples:                      # reassemble in stable (chrom, pos) order
         i = order_by_vidx[int(vidx)]
         mean[i, 0] = m; std[i, 0] = s; U_on[i, :] = np.asarray(u)
-    V_on, pcs_ref, U_on = _canonicalize_signs(V_on, pcs_ref, U_on)
+    V_on, pcs_ref, U_on = fraposa.canonicalize_signs(V_on, pcs_ref, U_on)
     print(f"eigendecomposition (distributed Gram): top s = {np.round(s_on[:dim_ref], 1)}")
     return mean, std, s_on, V_on, pcs_ref, U_on
 
@@ -358,6 +381,6 @@ def _fit_randomized(spark, kept_dose, order_by_vidx, n_var, n_panel, dim_ref, di
     s_on = s_all[:dim_online]; V_on = V_all[:, :dim_online]
     pcs_ref = V_all[:, :dim_ref] * s_all[:dim_ref]
     U_on = Ub[:, :dim_online]
-    V_on, pcs_ref, U_on = _canonicalize_signs(V_on, pcs_ref, U_on)
+    V_on, pcs_ref, U_on = fraposa.canonicalize_signs(V_on, pcs_ref, U_on)
     print(f"randomized SVD (ℓ={ell}, q={n_power_iter}): top s = {np.round(s_on[:dim_ref], 1)}")
     return mean, std, s_on, V_on, pcs_ref, U_on

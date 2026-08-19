@@ -20,9 +20,10 @@ serves `prs` as a read-only Volume artifact.
     (`sample_id, PC1..PCk`) — the covariates for GWAS.
 - **`pca_reference_setup`** job — **reference** basis (one-time, on demand):
   - `ref_00_download_panel.py` → `ref_01_build_basis.py` — stage the pgsc HGDP+1kGP panel, then
-    the SAME `lib/pca_fit` (pgenlib QC read this time) → `pca_basis.npz` on the `pca_reference`
-    volume. Spark-native, **no plink2**. This is the ancestry basis `prs`'s
-    `05_build_sample_ancestry` projects members onto.
+    the SAME `lib/pca_fit` (pgenlib QC read this time) → **`pca_basis.npz`** on the
+    `pca_reference` volume **and** `ancestry_pca` + `ancestry_classifier` MLflow pyfuncs at
+    `@champion`. Spark-native, **no plink2**. PRS extracts member gVCFs with `gvcf_dose`, then
+    projects via the models when registered (npz fallback). Fit math lives in `lib/fraposa.py`.
 - **`pca_initial_setup_job`** — registers the workflow.
 - Volumes: `pca_data`, `pca_results`, `pca_reference` (panel + basis, read cross-module by `prs`).
 

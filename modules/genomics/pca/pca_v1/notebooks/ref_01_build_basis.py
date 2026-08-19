@@ -2,10 +2,10 @@
 # MAGIC %md
 # MAGIC # Build the frozen FRAPOSA PCA basis (reference cohort) — Spark-native, distributed (classic; NOT serverless)
 # MAGIC
-# MAGIC pca_v1's **reference-cohort** entry point: fits PCA on the frozen HGDP+1kGP panel and emits a
-# MAGIC single **projectable** model `pca_basis.npz` (loadings, per-variant mean/std, loci, reference PC
-# MAGIC scores, superpop labels) that downstream modules consume as a read-only Volume artifact —
-# MAGIC `prs`'s `05_build_sample_ancestry` projects members onto it to classify ancestry (most-similar-pop).
+# MAGIC pca_v1's **reference-cohort** entry point: fits PCA on the frozen HGDP+1kGP panel and emits
+# MAGIC **both** a Volume `pca_basis.npz` (gVCF extract / npz fallback) **and** two MLflow pyfuncs
+# MAGIC (`ancestry_pca` + `ancestry_classifier` at `@champion`). PRS still extracts member gVCFs with
+# MAGIC `gvcf_dose`; the models own align/orient/impute/project so fit and serve cannot drift.
 # MAGIC The sibling `01_compute_pca` is the **in-cohort** entry point (same sample-covariance
 # MAGIC eigendecomposition, scores-only, for GWAS covariates); Task 2 collapses the two into one engine.
 # MAGIC **Entirely in Spark — no plink2, no binaries**, plus a **Hail-style windowed-r² LD prune**
@@ -35,6 +35,15 @@ dbutils.widgets.text("panel_pvar_parquet", "", "Panel .pvar.parquet (CHROM,POS,R
 dbutils.widgets.text("panel_psam", "", "Panel .psam (IID + SuperPop)")
 dbutils.widgets.text("king_cutoff", "", "king.cutoff.out.id (related samples to exclude)")
 dbutils.widgets.text("out_path", "", "Volume path to write pca_basis.npz")
+dbutils.widgets.text("pca_model_name", "ancestry_pca", "UC model name for the PCA pyfunc")
+dbutils.widgets.text("classifier_model_name", "ancestry_classifier", "UC model name for the classifier")
+dbutils.widgets.text("experiment_name", "dbx_genesis_workbench_modules", "MLflow experiment tag")
+dbutils.widgets.text("user_email", "a@b.com", "User Id/Email")
+dbutils.widgets.text("sql_warehouse_id", "w123", "SQL Warehouse Id")
+dbutils.widgets.text("n_pcs", "5", "PCs the classifier uses (pgsc_calc convention)")
+dbutils.widgets.text("impute_mode", "at_mean", "Missing-locus fill at serve: zero | at_mean | mean_af (at_mean = historical FRAPOSA)")
+dbutils.widgets.text("outlier_alpha", "0.001", "Mahalanobis P below this => PC-space outlier")
+dbutils.widgets.text("min_coverage_frac", "0.1", "Min fraction of basis loci a sample must cover")
 dbutils.widgets.text("dim_ref", "10", "Reference PC dimension (classify uses first 5)")
 dbutils.widgets.text("maf", "0.05", "Min MAF")
 dbutils.widgets.text("geno", "0.1", "Max per-variant missingness")
@@ -45,7 +54,17 @@ dbutils.widgets.text("panel_version", "pgsc_HGDP+1kGP_v2_nohwe", "Basis provenan
 
 # COMMAND ----------
 
-# MAGIC %pip install pgenlib==0.94.1 zstandard==0.23.0
+# Resolve the genesis_workbench wheel (for set_mlflow_experiment at model-registration time).
+_catalog0 = dbutils.widgets.get("catalog"); _schema0 = dbutils.widgets.get("schema")
+gwb_library_path = None
+for lib in dbutils.fs.ls(f"/Volumes/{_catalog0}/{_schema0}/libraries"):
+    if lib.name.startswith("genesis_workbench"):
+        gwb_library_path = lib.path.replace("dbfs:", "")
+print(f"Genesis Workbench library wheel: {gwb_library_path}")
+
+# COMMAND ----------
+
+# MAGIC %pip install pgenlib==0.94.1 zstandard==0.23.0 mlflow==2.22.0 scikit-learn==1.3.0 scipy==1.11.1 databricks-sdk==0.50.0 databricks-sql-connector==4.0.3 {gwb_library_path}
 # MAGIC dbutils.library.restartPython()
 
 # COMMAND ----------
@@ -62,6 +81,15 @@ catalog = dbutils.widgets.get("catalog"); schema = dbutils.widgets.get("schema")
 panel_pgen = dbutils.widgets.get("panel_pgen"); pvar_parquet = dbutils.widgets.get("panel_pvar_parquet")
 panel_psam = dbutils.widgets.get("panel_psam"); king_cutoff = dbutils.widgets.get("king_cutoff")
 out_path = dbutils.widgets.get("out_path"); dim_ref = int(dbutils.widgets.get("dim_ref"))
+pca_model_name = dbutils.widgets.get("pca_model_name")
+classifier_model_name = dbutils.widgets.get("classifier_model_name")
+experiment_name = dbutils.widgets.get("experiment_name")
+user_email = dbutils.widgets.get("user_email")
+sql_warehouse_id = dbutils.widgets.get("sql_warehouse_id")
+n_pcs = int(dbutils.widgets.get("n_pcs"))
+impute_mode = dbutils.widgets.get("impute_mode").strip() or "at_mean"
+outlier_alpha = float(dbutils.widgets.get("outlier_alpha"))
+min_coverage_frac = float(dbutils.widgets.get("min_coverage_frac"))
 MAF = float(dbutils.widgets.get("maf")); GENO = float(dbutils.widgets.get("geno"))
 R2 = float(dbutils.widgets.get("r2")); WINDOW_BP = int(dbutils.widgets.get("window_bp"))
 BLOCK = int(dbutils.widgets.get("block_size")); panel_version = dbutils.widgets.get("panel_version")
@@ -194,10 +222,11 @@ print(f"QC-passing variants: {qc.count()}")
 
 import sys
 sys.path.append(os.path.abspath(os.path.join(os.getcwd(), "..", "lib")))
+sys.path.append(os.path.abspath(os.path.join(os.getcwd(), "..", "model")))
 import pca_fit
 
 try:
-    pca_fit.fit_pca_model(
+    fit = pca_fit.fit_pca_model(
         spark, qc,
         sample_ids=unrel_iids, superpops=superpops,
         dim_ref=dim_ref, r2=R2, window_bp=WINDOW_BP,
@@ -205,3 +234,67 @@ try:
     )
 finally:
     spark.sql("DROP TABLE IF EXISTS _pca_qc_dose")   # transient QC store — cleaned up even on fit failure
+
+print(f"npz: {out_path} | {fit['n_var']} loci · {fit['n_panel']} panel samples · dim_ref={fit['dim_ref']}")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### 4. Register `ancestry_pca` + `ancestry_classifier` at `@champion`
+# MAGIC Same fitted arrays as the npz. PRS loads these when present; npz remains the gVCF-extract catalog
+# MAGIC and the fallback if the registry is empty.
+
+# COMMAND ----------
+
+import mlflow
+from mlflow import MlflowClient
+from genesis_workbench.workbench import initialize
+from genesis_workbench.models import set_mlflow_experiment
+import log_ancestry_models as lm
+
+_token = dbutils.notebook.entry_point.getDbutils().notebook().getContext().apiToken().getOrElse(None)
+initialize(core_catalog_name=catalog, core_schema_name=schema,
+           sql_warehouse_id=sql_warehouse_id, token=_token)
+
+set_mlflow_experiment(experiment_tag=experiment_name, user_email=user_email, shared=True)
+mlflow.set_registry_uri("databricks-uc")
+mlflow.set_tracking_uri("databricks")
+
+pca_uc = f"{catalog}.{schema}.{pca_model_name}"
+clf_uc = f"{catalog}.{schema}.{classifier_model_name}"
+
+with mlflow.start_run(run_name=f"ancestry-basis-{panel_version}") as run:
+    mlflow.log_params({"panel_version": panel_version, "n_loci": fit["n_var"],
+                       "n_panel": fit["n_panel"], "dim_ref": fit["dim_ref"],
+                       "n_pcs": n_pcs, "impute_mode": impute_mode,
+                       "outlier_alpha": outlier_alpha, "min_coverage_frac": min_coverage_frac,
+                       "npz_path": out_path})
+    lm.log_ancestry_pca(
+        fit, panel_version=panel_version, uc_model_name=pca_uc, n_pcs=n_pcs,
+        impute_mode=impute_mode, min_coverage_frac=min_coverage_frac,
+        registered_model_name=pca_uc)
+    lm.log_ancestry_classifier(
+        fit, superpops, uc_model_name=clf_uc, n_pcs=n_pcs,
+        outlier_alpha=outlier_alpha, min_coverage_frac=min_coverage_frac,
+        registered_model_name=clf_uc)
+    print(f"registered {pca_uc} and {clf_uc} | run {run.info.run_id}")
+
+_client = MlflowClient()
+for uc in (pca_uc, clf_uc):
+    v = max(int(mv.version) for mv in _client.search_model_versions(f"name = '{uc}'"))
+    _client.set_registered_model_alias(uc, "champion", v)
+    print(f"  {uc}@champion -> v{v}")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### 5. Persist the panel PC1/PC2 cloud (app ancestry scatter)
+
+# COMMAND ----------
+
+ref_pcs = lm.build_reference_pcs(fit, superpops, n_pcs=2)
+ref_tbl = f"{catalog}.{schema}.ancestry_pca_reference_pcs"
+(spark.createDataFrame(ref_pcs)
+ .withColumn("panel_version", F.lit(panel_version))
+ .write.mode("overwrite").option("overwriteSchema", "true").saveAsTable(ref_tbl))
+print(f"wrote reference PC cloud ({len(ref_pcs)} panel samples) → {ref_tbl}")

@@ -11,6 +11,10 @@
 # MAGIC z_msp = (raw − panel_mean[pgs,msp]) / panel_sd[pgs,msp]      (reference-panel normalized; no cohort re-rank)
 # MAGIC ```
 # MAGIC Runs on a classic cluster started minimal + titrated (see job.yml). MERGE-upserts the flat `prs_scores`.
+# MAGIC
+# MAGIC **PGS chunking:** large planned weight unions densify into multi‑GB shuffles under `mean_impute`.
+# MAGIC Set `pgs_chunk_size` (>0) or `max_weight_rows_per_chunk` to bound each join; within a chunk that
+# MAGIC fits `WEIGHTS_BROADCAST_MAX_ROWS`, weights are force-broadcast so dose streams.
 
 # COMMAND ----------
 
@@ -21,14 +25,25 @@ dbutils.widgets.text("schema", "genesis_schema", "Schema")
 # and panel_mean would be computed under different missing policies). At WGS coverage the raw-score
 # effect vs drop is negligible. Use drop only for a raw-only run with no panel/z.
 dbutils.widgets.text("missing_mode", "mean_impute", "mean_impute = missing→2·AF from pgs_panel_afreq (matches panel; calibrated z) | drop = missing→0 (raw-only)")
+# 0 = score the full planned PGS set in one join (legacy / baseline A/B). >0 = fixed PGS count per chunk.
+dbutils.widgets.text("pgs_chunk_size", "0", "Fixed # PGS per score chunk (0 = use weight budget or all-at-once)")
+# When pgs_chunk_size=0: greedy-pack PGS until Σ weight rows hits this budget. 0 disables packing.
+dbutils.widgets.text("max_weight_rows_per_chunk", "0", "Weight-row budget per chunk when pgs_chunk_size=0 (0 = no chunking / all-at-once)")
 catalog = dbutils.widgets.get("catalog"); schema = dbutils.widgets.get("schema")
 missing_mode = dbutils.widgets.get("missing_mode").strip().lower()
+pgs_chunk_size = int(dbutils.widgets.get("pgs_chunk_size") or "0")
+max_weight_rows_per_chunk = int(dbutils.widgets.get("max_weight_rows_per_chunk") or "0")
 
 # COMMAND ----------
 
 import math
+import os
+import sys
+import time
+
 import pyspark.sql.functions as F
 from delta.tables import DeltaTable
+from pyspark.sql import DataFrame
 
 spark.sql(f"USE CATALOG {catalog}"); spark.sql(f"USE SCHEMA {schema}")
 spark.conf.set("spark.sql.shuffle.partitions", "auto")  # bounded by classic cluster size
@@ -37,105 +52,81 @@ plan = spark.table("_prs_reconcile_plan")                 # sample_id, pgs_id, w
 if plan.limit(1).count() == 0:
     dbutils.notebook.exit("0")  # reconcile found nothing; scorer is a no-op
 
+sys.path.append(os.path.abspath(os.path.join(os.getcwd(), "..", "lib")))
+from prs_readiness import assert_scoring_ready
+from score_chunks import chunk_by_weight_budget, chunk_fixed
+
+assert_scoring_ready(spark, catalog, schema, plan, require_models=False)
+
 planned_samples = plan.select("sample_id").distinct()
 planned_pgs = plan.select("pgs_id", "weight_sha").distinct()
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ### 1. Raw score — join the planned samples' dosage to the planned PGS' weights
-# MAGIC `dose` is pruned to the plan's samples and `wts` to the plan's PGS, so the aggregate spans that
-# MAGIC grid; the FINAL left-join onto the plan (below) keeps exactly the planned cells and fills any
-# MAGIC zero-coverage ones (raw=0) so each planned cell is written once. For single-mode plans (add-sample
-# MAGIC / add-PGS / restate-one) the grid IS the plan, so nothing extra is aggregated.
+# MAGIC ### 0. Dose prune + PGS chunk plan
+# MAGIC Dose is loaded once; each chunk filters plan/weights and MERGE-upserts independently.
 
 # COMMAND ----------
 
-# Incremental fast path: when the plan targets few samples (add-sample / small batch), prune
-# `dosage` with an explicit sample_id predicate so Liquid Clustering (CLUSTER BY sample_id) SKIPS
-# files instead of scanning the whole store. Stage-0 measured that a broadcast join here re-scans
-# all dosage rows even to score one new sample; the predicate turns that full scan into a file-skip.
-# Full backfills (many planned samples) skip the predicate and read all files (correct + fastest).
-# Broadcast the planned weights when they're small enough (used by the drop-path join below). EXPLAIN
-# (benchmark/SCALE_LADDER_1K_FINDINGS.md) showed `dose ⋈ wts` defaults to a SortMergeJoin — `wts` is a
-# derived relation whose size the optimizer over-estimates, so it never auto-broadcasts even when tiny and
-# AQE doesn't convert it — shuffling the whole dose side (~2.2 GB per 128M rows). ~3M weight rows ≈ a few
-# hundred MB broadcast, safe on the compute cluster's 16g driver; larger unions exceed this and correctly
-# stay a shuffle join (chunk that backfill by sample batch).
 WEIGHTS_BROADCAST_MAX_ROWS = 3_000_000
 SAMPLE_PREDICATE_MAX = 200
 _planned_ids = [r["sample_id"] for r in planned_samples.limit(SAMPLE_PREDICATE_MAX + 1).collect()]
 if 0 < len(_planned_ids) <= SAMPLE_PREDICATE_MAX:
-    dose = spark.table("dosage").where(F.col("sample_id").isin(_planned_ids))            # file-skip to planned samples
+    dose = spark.table("dosage").where(F.col("sample_id").isin(_planned_ids))
 else:
-    dose = spark.table("dosage").join(F.broadcast(planned_samples), "sample_id")         # backfill: read all
-wts = spark.table("pgs_weights").join(F.broadcast(planned_pgs), ["pgs_id", "weight_sha"])  # only planned pgs@sha
+    dose = spark.table("dosage").join(F.broadcast(planned_samples), "sample_id")
 
-# Missing-variant handling (pgsc_calc/plink2 semantics):
-#   mean_impute (default): score over EXACTLY the panel-matched variant set (inner-join pgs_panel_afreq),
-#     with missing → 2·AF(effect) from the frozen panel — matching the reference implementation mean_impute / plink2
-#     --read-freq. Restricting to the panel-matched set is REQUIRED for calibrated z: pgs_panel_ref's
-#     mean/sd are the panel's scores over those same variants, so the member raw must sum the same set
-#     (a member variant the panel never matched has no panel distribution to standardize against). Without
-#     this restriction the member sums extra variants → raw on a larger scale → z inflated (seen as
-#     |z|>5 on PGS whose off-panel variants carry heavy weight). Densifies (cell × panel-matched variants).
-#   drop: a PGS variant not covered by the sample contributes 0 (inner join on dose). Parity path for
-#     raw-only runs with no panel/z; not calibrated against pgs_panel_ref.
 _use_impute = missing_mode == "mean_impute" and spark.catalog.tableExists("pgs_panel_afreq")
 if missing_mode == "mean_impute" and not _use_impute:
     print("WARN: missing_mode=mean_impute but pgs_panel_afreq absent → falling back to drop")
 
-if _use_impute:
-    afreq = spark.table("pgs_panel_afreq").select("variant_id", "af_effect")
-    dose_sv = dose.select("sample_id", "variant_id", F.col("dose").alias("_d"))
-    agg = (
-        plan.join(wts, ["pgs_id", "weight_sha"])                       # densify: cell × PGS' variants
-        .join(afreq, "variant_id", "inner")                            # RESTRICT to the panel-matched set (= panel scope)
-        .join(dose_sv, ["sample_id", "variant_id"], "left")
-        .withColumn("dose_f", F.coalesce(F.col("_d"), 2.0 * F.col("af_effect")))  # covered→real dose; missing→2·AF(panel)
-        .groupBy("sample_id", "pgs_id", "weight_sha")
-        .agg(F.sum(F.col("dose_f") * F.col("weight")).alias("raw_score"),
-             F.sum(F.col("_d").isNotNull().cast("int")).alias("n_variants_matched"))  # matched = real coverage
-    )
-else:
-    # Force-broadcast the weights when broadcast-safe so the dose STREAMS (no ~2.2 GB dose shuffle) and
-    # sum() aggregates map-side; a large union exceeds the guard and stays a shuffle join. See the
-    # WEIGHTS_BROADCAST_MAX_ROWS note above (EXPLAIN-confirmed: default is SortMergeJoin even for tiny wts).
-    _wts = F.broadcast(wts) if wts.count() <= WEIGHTS_BROADCAST_MAX_ROWS else wts
-    agg = (
-        dose.join(_wts, "variant_id")
-        .groupBy("sample_id", "pgs_id", "weight_sha")
-        .agg(F.sum(F.col("dose") * F.col("weight")).alias("raw_score"),
-             F.count(F.lit(1)).alias("n_variants_matched"))
-    )
-
-# Left-join the aggregate onto the plan so EVERY planned cell is written exactly once — a cell whose
-# sample shares no variant with the PGS (zero coverage) still lands as raw=0, matched=0 instead of
-# vanishing (an inner join would drop it, and reconcile would then re-plan it every run forever).
-raw = (
-    plan.join(agg, ["sample_id", "pgs_id", "weight_sha"], "left")
-    .withColumn("raw_score", F.coalesce(F.col("raw_score"), F.lit(0.0)))
-    .withColumn("n_variants_matched", F.coalesce(F.col("n_variants_matched"), F.lit(0)))
+afreq = (
+    spark.table("pgs_panel_afreq").select("variant_id", "af_effect")
+    if _use_impute else None
 )
+dose_sv = dose.select("sample_id", "variant_id", F.col("dose").alias("_d"))
 
-# coverage vs the PGS' total variant count (from registry)
-nvar = spark.table("pgs_registry").select("pgs_id", F.col("n_variants").alias("pgs_nvar"))
-raw = (raw.join(nvar, "pgs_id", "left")
-       .withColumn("coverage_pct", F.when(F.col("pgs_nvar") > 0, 100.0 * F.col("n_variants_matched") / F.col("pgs_nvar")))
-       .withColumn("small_score", F.col("n_variants_matched") < F.lit(1000)))
+# Weight counts for budget packing (cheap agg over planned PGS only).
+_wcount = (
+    spark.table("pgs_weights")
+    .join(F.broadcast(planned_pgs), ["pgs_id", "weight_sha"])
+    .groupBy("pgs_id", "weight_sha")
+    .count()
+    .withColumnRenamed("count", "n_weights")
+)
+_pgs_rows = [r.asDict() for r in _wcount.collect()]
+_pgs_rows.sort(key=lambda r: (-int(r["n_weights"]), r["pgs_id"]))
+
+if pgs_chunk_size > 0:
+    _chunks = chunk_fixed(_pgs_rows, pgs_chunk_size)
+    _chunk_mode = f"fixed_size={pgs_chunk_size}"
+elif max_weight_rows_per_chunk > 0 and len(_pgs_rows) > 1:
+    _chunks = chunk_by_weight_budget(
+        _pgs_rows, max_weight_rows=max_weight_rows_per_chunk
+    )
+    _chunk_mode = f"weight_budget={max_weight_rows_per_chunk}"
+else:
+    _chunks = chunk_fixed(_pgs_rows, 0)
+    _chunk_mode = "all_at_once"
+
+print(
+    f"score chunks: mode={_chunk_mode} n_pgs={len(_pgs_rows)} n_chunks={len(_chunks)} "
+    f"missing_mode={'mean_impute' if _use_impute else 'drop'}"
+)
+for i, ch in enumerate(_chunks):
+    print(
+        f"  chunk[{i}] n_pgs={len(ch)} n_weights={sum(int(r['n_weights']) for r in ch)} "
+        f"pgs={[r['pgs_id'] for r in ch[:5]]}{'…' if len(ch) > 5 else ''}"
+    )
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ### 2. Reference-panel normalization — z_msp (single MSP) + z_admixed (RF-posterior-weighted)
-# MAGIC `sample_ancestry` (from the ancestry module) gives `most_similar_pop` → the panel superpop row to
-# MAGIC standardize against (`z_msp`), plus `rf_probs` → the continuous-ancestry `z_admixed`. Frozen panel ⇒
-# MAGIC a new sample's z needs no cohort re-rank.
+# MAGIC ### 1–3. Per-chunk raw score → z normalization → MERGE
 
 # COMMAND ----------
 
-# is_outlier flags a sample the ancestry classifier couldn't place (out-of-reference / too-low
-# coverage — see 04_build_sample_ancestry). Fall back to False if the column predates this feature.
 _has_outlier = "is_outlier" in spark.table("sample_ancestry").columns
 anc = spark.table("sample_ancestry").select(
     "sample_id", F.col("most_similar_pop").alias("msp"),
@@ -143,83 +134,146 @@ anc = spark.table("sample_ancestry").select(
 ref = spark.table("pgs_panel_ref").select(
     "pgs_id", F.col("superpop").alias("msp"), "panel_version",
     F.col("mean").alias("ref_mean"), F.col("sd").alias("ref_sd"))
-
-scored = (
-    raw  # already carries panel_version (joined from the plan above)
-    .join(anc, "sample_id", "left")
-    .join(ref, ["pgs_id", "msp", "panel_version"], "left")
-    .withColumn("z_msp", F.when(F.col("ref_sd") > 0, (F.col("raw_score") - F.col("ref_mean")) / F.col("ref_sd")))
-)
-
-# percentile from z via the normal CDF (parametric); empirical-from-panel-quantiles is a refinement.
-@F.udf("double")
-def _norm_cdf_pct(z):
-    return None if z is None else 100.0 * 0.5 * (1.0 + math.erf(float(z) / math.sqrt(2.0)))
-
-scored = scored.withColumn("percentile_msp", _norm_cdf_pct(F.col("z_msp")))
-
-# ── z_admixed — continuous-ancestry (PRSmix-style) normalization ─────────────────────────────
-# Standardize raw against EACH panel superpop's distribution and weight by the RF ancestry
-# posterior (rf_probs, persisted by 04_build_sample_ancestry):  z_admixed = Σ_pop P_RF(pop)·z_pop.
-# Uses the SAME PGS + the existing pgs_panel_ref (per-superpop mean/sd), so it needs no bespoke
-# per-ancestry PGS catalog. For a non-admixed sample (RF ~1.0 on its MSP) it collapses to z_msp;
-# for an admixed sample it blends the superpop references. Degenerate rows (sd=0 / prob=0) drop and
-# the surviving weights renormalize (mass redistribution) — matching the reference admixed-score routine.
-# (PRSmix+ with DISTINCT per-ancestry PGS variants + MyOme β/caPRS weighting is a curation-heavy
-#  extension deliberately left out of the core scorer.)
 probs = (spark.table("sample_ancestry")
          .select("sample_id", F.from_json(F.col("rf_probs"), "map<string,double>").alias("_p"))
          .select("sample_id", F.explode("_p").alias("superpop", "prob")))
 ref_all = spark.table("pgs_panel_ref").select(
     "pgs_id", "superpop", "panel_version", F.col("mean").alias("amean"), F.col("sd").alias("asd"))
-adm = (
-    raw.select("sample_id", "pgs_id", "panel_version", "raw_score")
-    .join(probs, "sample_id")
-    .join(ref_all, ["pgs_id", "superpop", "panel_version"])
-    .where((F.col("asd") > 0) & (F.col("prob") > 0))
-    .withColumn("z_anc", (F.col("raw_score") - F.col("amean")) / F.col("asd"))
-    .groupBy("sample_id", "pgs_id")
-    .agg((F.sum(F.col("prob") * F.col("z_anc")) / F.sum(F.col("prob"))).alias("z_admixed"))
-)
-scored = (scored.join(adm, ["sample_id", "pgs_id"], "left")
-          .withColumn("percentile_admixed", _norm_cdf_pct(F.col("z_admixed"))))
+nvar = spark.table("pgs_registry").select("pgs_id", F.col("n_variants").alias("pgs_nvar"))
+reg = spark.table("pgs_registry").select(
+    "pgs_id", "score_id", "disease", "direction", "hr_per_sd", "clinical_model")
 
-# Withhold calibrated z for flagged outliers: normalizing a sample against a reference panel it does
-# not belong to (or projecting it from near-zero coverage) yields a misleading z. Keep raw_score +
-# coverage (still meaningful); null the z/percentile columns. `is_outlier` rides in `scored` from anc.
-for _zc in ("z_msp", "percentile_msp", "z_admixed", "percentile_admixed"):
-    scored = scored.withColumn(_zc, F.when(~F.col("is_outlier"), F.col(_zc)))
+@F.udf("double")
+def _norm_cdf_pct(z):
+    return None if z is None else 100.0 * 0.5 * (1.0 + math.erf(float(z) / math.sqrt(2.0)))
 
-# registry metadata + result columns (clinical/concordance left null here — later stages fill them)
-reg = spark.table("pgs_registry").select("pgs_id", "score_id", "disease", "direction", "hr_per_sd", "clinical_model")
-out = (
-    scored.join(reg, "pgs_id", "left")
-    .withColumn("used_ancestry", F.col("msp"))
-    .withColumn("integrated_z_source", F.when(F.col("z_admixed").isNotNull(), F.lit("admixed")).otherwise(F.lit("msp")))
-    .withColumn("integrated_risk_10yr", F.lit(None).cast("double"))
-    .withColumn("clinical_risk_10yr", F.lit(None).cast("double"))
-    .withColumn("risk_category", F.lit(None).cast("string"))
-    .withColumn("concordance_verdict", F.lit(None).cast("string"))
-    .withColumn("computed_at", F.current_timestamp())
-    .select("sample_id", "pgs_id", "weight_sha", "panel_version", "raw_score", "n_variants_matched",
-            "coverage_pct", "small_score", F.col("msp").alias("most_similar_pop"), "used_ancestry",
-            "z_msp", "percentile_msp", "z_admixed", "percentile_admixed", "integrated_z_source",
-            "integrated_risk_10yr", "clinical_risk_10yr", "risk_category", "concordance_verdict", "computed_at")
-)
 
-# COMMAND ----------
+def _raw_agg(plan_c: DataFrame, wts_c: DataFrame, *, broadcast_wts: bool) -> DataFrame:
+    """Join-aggregate raw scores for one PGS chunk."""
+    if _use_impute:
+        wts_panel = wts_c.join(afreq, "variant_id", "inner")
+        _wp = F.broadcast(wts_panel) if broadcast_wts else wts_panel
+        # densify: cell × panel-matched variants, then left-join dose (missing→2·AF)
+        agg = (
+            plan_c.join(_wp, ["pgs_id", "weight_sha"])
+            .join(dose_sv, ["sample_id", "variant_id"], "left")
+            .withColumn("dose_f", F.coalesce(F.col("_d"), 2.0 * F.col("af_effect")))
+            .groupBy("sample_id", "pgs_id", "weight_sha")
+            .agg(
+                F.sum(F.col("dose_f") * F.col("weight")).alias("raw_score"),
+                F.sum(F.col("_d").isNotNull().cast("int")).alias("n_variants_matched"),
+            )
+        )
+    else:
+        _wts = F.broadcast(wts_c) if broadcast_wts else wts_c
+        agg = (
+            dose.join(_wts, "variant_id")
+            .groupBy("sample_id", "pgs_id", "weight_sha")
+            .agg(
+                F.sum(F.col("dose") * F.col("weight")).alias("raw_score"),
+                F.count(F.lit(1)).alias("n_variants_matched"),
+            )
+        )
 
-# MAGIC %md
-# MAGIC ### 3. MERGE-upsert into the flat `prs_scores` cell-store (MERGE-safe: no Glow structs)
+    raw = (
+        plan_c.join(agg, ["sample_id", "pgs_id", "weight_sha"], "left")
+        .withColumn("raw_score", F.coalesce(F.col("raw_score"), F.lit(0.0)))
+        .withColumn("n_variants_matched", F.coalesce(F.col("n_variants_matched"), F.lit(0)))
+    )
+    return (
+        raw.join(nvar, "pgs_id", "left")
+        .withColumn(
+            "coverage_pct",
+            F.when(F.col("pgs_nvar") > 0, 100.0 * F.col("n_variants_matched") / F.col("pgs_nvar")),
+        )
+        .withColumn("small_score", F.col("n_variants_matched") < F.lit(1000))
+    )
 
-# COMMAND ----------
 
-out.createOrReplaceTempView("_scored")
+def _normalize(raw: DataFrame) -> DataFrame:
+    scored = (
+        raw.join(anc, "sample_id", "left")
+        .join(ref, ["pgs_id", "msp", "panel_version"], "left")
+        .withColumn(
+            "z_msp",
+            F.when(F.col("ref_sd") > 0, (F.col("raw_score") - F.col("ref_mean")) / F.col("ref_sd")),
+        )
+        .withColumn("percentile_msp", _norm_cdf_pct(F.col("z_msp")))
+    )
+    adm = (
+        raw.select("sample_id", "pgs_id", "panel_version", "raw_score")
+        .join(probs, "sample_id")
+        .join(ref_all, ["pgs_id", "superpop", "panel_version"])
+        .where((F.col("asd") > 0) & (F.col("prob") > 0))
+        .withColumn("z_anc", (F.col("raw_score") - F.col("amean")) / F.col("asd"))
+        .groupBy("sample_id", "pgs_id")
+        .agg((F.sum(F.col("prob") * F.col("z_anc")) / F.sum(F.col("prob"))).alias("z_admixed"))
+    )
+    scored = (
+        scored.join(adm, ["sample_id", "pgs_id"], "left")
+        .withColumn("percentile_admixed", _norm_cdf_pct(F.col("z_admixed")))
+    )
+    for _zc in ("z_msp", "percentile_msp", "z_admixed", "percentile_admixed"):
+        scored = scored.withColumn(_zc, F.when(~F.col("is_outlier"), F.col(_zc)))
+    return (
+        scored.join(reg, "pgs_id", "left")
+        .withColumn("used_ancestry", F.col("msp"))
+        .withColumn(
+            "integrated_z_source",
+            F.when(F.col("z_admixed").isNotNull(), F.lit("admixed")).otherwise(F.lit("msp")),
+        )
+        .withColumn("integrated_risk_10yr", F.lit(None).cast("double"))
+        .withColumn("clinical_risk_10yr", F.lit(None).cast("double"))
+        .withColumn("risk_category", F.lit(None).cast("string"))
+        .withColumn("concordance_verdict", F.lit(None).cast("string"))
+        .withColumn("computed_at", F.current_timestamp())
+        .select(
+            "sample_id", "pgs_id", "weight_sha", "panel_version", "raw_score",
+            "n_variants_matched", "coverage_pct", "small_score",
+            F.col("msp").alias("most_similar_pop"), "used_ancestry",
+            "z_msp", "percentile_msp", "z_admixed", "percentile_admixed",
+            "integrated_z_source", "integrated_risk_10yr", "clinical_risk_10yr",
+            "risk_category", "concordance_verdict", "computed_at",
+        )
+    )
+
+
 tgt = DeltaTable.forName(spark, f"{catalog}.{schema}.prs_scores")
-(tgt.alias("t").merge(spark.table("_scored").alias("s"), "t.sample_id = s.sample_id AND t.pgs_id = s.pgs_id")
-   .whenMatchedUpdateAll()
-   .whenNotMatchedInsertAll()
-   .execute())
+total_cells = 0
+t_all = time.time()
 
-n = spark.table("_scored").count()
-print(f"scored + upserted {n} (sample,pgs) cells into {catalog}.{schema}.prs_scores")
+for ci, ch in enumerate(_chunks):
+    t0 = time.time()
+    chunk_keys = spark.createDataFrame(
+        [(r["pgs_id"], r["weight_sha"]) for r in ch],
+        schema="pgs_id STRING, weight_sha STRING",
+    )
+    plan_c = plan.join(F.broadcast(chunk_keys), ["pgs_id", "weight_sha"])
+    wts_c = spark.table("pgs_weights").join(F.broadcast(chunk_keys), ["pgs_id", "weight_sha"])
+    n_w = sum(int(r["n_weights"]) for r in ch)
+    broadcastable = n_w <= WEIGHTS_BROADCAST_MAX_ROWS
+
+    out = _normalize(_raw_agg(plan_c, wts_c, broadcast_wts=broadcastable))
+    out.createOrReplaceTempView("_scored_chunk")
+    (
+        tgt.alias("t")
+        .merge(
+            spark.table("_scored_chunk").alias("s"),
+            "t.sample_id = s.sample_id AND t.pgs_id = s.pgs_id",
+        )
+        .whenMatchedUpdateAll()
+        .whenNotMatchedInsertAll()
+        .execute()
+    )
+    n = spark.table("_scored_chunk").count()
+    total_cells += n
+    print(
+        f"chunk[{ci}/{len(_chunks)}] cells={n} n_pgs={len(ch)} n_weights={n_w} "
+        f"broadcast={broadcastable} wall_s={time.time() - t0:.1f}"
+    )
+
+print(
+    f"scored + upserted {total_cells} (sample,pgs) cells into {catalog}.{schema}.prs_scores "
+    f"in {len(_chunks)} chunks ({time.time() - t_all:.1f}s)"
+)
+dbutils.notebook.exit(str(total_cells))

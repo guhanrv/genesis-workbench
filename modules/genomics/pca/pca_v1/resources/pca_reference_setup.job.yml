@@ -18,6 +18,11 @@ resources:
         on_failure:
           - ${var.current_user}
 
+      # App-dispatched (and CLI) runs need the UI SP to survive bundle deploy.
+      permissions:
+        - level: CAN_MANAGE_RUN
+          service_principal_name: ${var.app_sp_client_id}
+
       tasks:
         # 1 — download + stage the pgsc panel (pgen/pvar.zst/psam/king.cutoff) + derive pvar.parquet.
         - task_key: download_panel
@@ -60,6 +65,24 @@ resources:
           default: ${var.pca_reference_dir}/GRCh38_HGDP+1kGP_ALL.pgen
         - name: panel_pvar_parquet
           default: ${var.pca_reference_dir}/GRCh38_HGDP+1kGP_ALL.pvar.parquet
+        - name: pca_model_name
+          default: ${var.ancestry_pca_model_name}
+        - name: classifier_model_name
+          default: ${var.ancestry_classifier_model_name}
+        - name: experiment_name
+          default: ${var.module_registration_experiment_name}
+        - name: user_email
+          default: ${var.current_user}
+        - name: sql_warehouse_id
+          default: ${var.sql_warehouse_id}
+        - name: n_pcs
+          default: "5"
+        - name: impute_mode
+          default: "at_mean"
+        - name: outlier_alpha
+          default: "0.001"
+        - name: min_coverage_frac
+          default: "0.1"
 
       job_clusters:
         # The 84M-variant QC scan is CPU-bound and saturates a single node (~100% on 8 cores → ~55 min).

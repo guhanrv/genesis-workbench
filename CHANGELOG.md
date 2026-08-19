@@ -2,6 +2,19 @@
 
 ## Unreleased — Genomics: PRS + ancestry/population-structure PCA
 
+**Direction B packaging (2026-08-18).** Keep the gVCF END-block engine, reconcile dry-run, and
+classic clusters. Port Databricks-clone packaging: `lib/fraposa.py` as the single fit/OADP/RF
+home; `ref_01_build_basis` writes `pca_basis.npz` **and** registers `ancestry_pca` +
+`ancestry_classifier` at `@champion`; PRS ancestry prefers those models with npz fallback;
+fail-loud empty PGS overlap after extract; scoring readiness gate; declarative app-SP
+`CAN_MANAGE_RUN`. Explicit non-goals: Glow-only member ingest, serverless scoring default,
+dropping GWAS `pca_scores_table`. See `DIRECTION_B_CONTRACT.md`.
+
+**Synthetic PRS scale path (2026-08-19).** Optional `sample_manifest` fan-out copies canonical
+dosage/ancestry to reserved `synth_*` IDs (parse gVCF once). Guarded by
+`confirm_synthetic_fanout` + row cap. Optional PGS-axis chunking stays **off** by default
+(measured slower than all-at-once at n=10).
+
 Two new `genomics` submodules, both Spark/Glow-native (same modality as `gwas`; no PLINK / `pgsc_calc`),
 added to the genomics submodule list so each is deployable on its own
 (`--only-submodule prs/prs_v1` / `--only-submodule pca/pca_v1`).

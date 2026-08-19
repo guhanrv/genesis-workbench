@@ -4,7 +4,8 @@ resources:
       name: prs_scoring
 
       # Distributed, incremental, multi-PGS / multi-sample PRS.
-      #   setup_stores -> register -> extract_dosage -> reconcile -> score_prs
+      #   setup_stores -> register -> extract_dosage -> ancestry -> optional synthetic fan-out
+      #                -> reconcile -> score_prs
       # ALL tasks run on CLASSIC job clusters with a fixed, explicit num_workers, started
       # MINIMAL (single-node) and titrated up per job from benchmark numbers. NOTHING runs
       # on serverless (its unbounded autoscale is the #1 bill-blowup risk). Job clusters are
@@ -50,12 +51,17 @@ resources:
           notebook_task:
             notebook_path: ../notebooks/02_extract_dosage.py
             source: WORKSPACE
+          libraries:
+            - pypi:
+                package: pysam==0.22.1
 
         # 4 — the incremental brain + cost kill-switch: emit ONLY missing/stale cells.
         - task_key: reconcile
           max_retries: 0
           depends_on:
-            - task_key: extract_dosage
+            - task_key: materialize_scale_manifest
+            - task_key: build_sample_ancestry
+          run_if: NONE_FAILED
           job_cluster_key: prs_light_cluster
           notebook_task:
             notebook_path: ../notebooks/03_reconcile.py
@@ -73,6 +79,38 @@ resources:
           job_cluster_key: prs_extract_cluster
           notebook_task:
             notebook_path: ../notebooks/04_build_sample_ancestry.py
+            source: WORKSPACE
+          libraries:
+            - pypi:
+                package: pysam==0.22.1
+            - pypi:
+                package: scikit-learn==1.3.0
+            - pypi:
+                package: scipy==1.11.1
+            - pypi:
+                package: mlflow==2.22.0
+
+        # 4c — condition task prevents the 5-node fan-out cluster from starting in production.
+        - task_key: fanout_enabled
+          depends_on:
+            - task_key: extract_dosage
+            - task_key: build_sample_ancestry
+          condition_task:
+            op: NOT_EQUAL
+            left: "{{job.parameters.sample_manifest_path}}"
+            right: ""
+
+        # SYNTHETIC scale testing only. Copies canonical dosage/ancestry rows to logical IDs
+        # using a bounded, distributed Delta fan-out. It never reparses one gVCF N times.
+        - task_key: materialize_scale_manifest
+          max_retries: 1
+          timeout_seconds: 14400
+          depends_on:
+            - task_key: fanout_enabled
+              outcome: "true"
+          job_cluster_key: prs_fanout_cluster
+          notebook_task:
+            notebook_path: ../notebooks/materialize_scale_manifest.py
             source: WORKSPACE
 
         # 5 — SQL join-aggregate over the plan + panel-ref normalization + MERGE prs_scores.
@@ -157,9 +195,28 @@ resources:
           default: ${var.prs_fasta_ref_cache}
         - name: reextract                # true to re-extract existing samples (after add-PGS)
           default: "false"
+        # synthetic scale manifest — empty in every production run
+        - name: sample_manifest_path
+          default: ""
+        - name: confirm_synthetic_fanout
+          default: "false"
+        - name: fanout_batch_size
+          default: "25"
+        - name: max_fanout_rows
+          default: "1000000000"
+        - name: target_rows_per_file
+          default: "2000000"
+        - name: fanout_staging_root
+          default: ""
         # ancestry (build_sample_ancestry) — the frozen PCA basis it projects members onto
         - name: basis_path
           default: ${var.prs_pca_basis}
+        - name: pca_model_name
+          default: ancestry_pca
+        - name: classifier_model_name
+          default: ancestry_classifier
+        - name: model_alias
+          default: champion
         # scope (register + extract + reconcile all honor pgs_ids)
         - name: pgs_ids
           default: ""
@@ -176,6 +233,13 @@ resources:
           default: "false"
         - name: dbu_per_cell             # set from Stage-0 benchmark to get a cost estimate
           default: "0.0"
+        # score_prs — PGS-axis chunking (bounds mean_impute densify / shuffle)
+        - name: pgs_chunk_size           # >0 = fixed # PGS per chunk; 0 = use weight budget
+          default: "0"
+        - name: max_weight_rows_per_chunk  # when pgs_chunk_size=0; 0 = all-at-once (keep until A/B wins)
+          default: "0"
+        - name: missing_mode
+          default: "mean_impute"
 
       # Classic job clusters. START MINIMAL (single-node); titrate num_workers per job from
       # benchmark evidence. SINGLE_USER is required for Unity Catalog access. cpu_node_type
@@ -217,13 +281,29 @@ resources:
             node_type_id: ${var.cpu_node_type}
             data_security_mode: SINGLE_USER
             runtime_engine: STANDARD
-            num_workers: 0                          # TITRATE UP if shuffle/throughput needs it
+            num_workers: 0                          # TITRATE UP after PGS-chunk A/B (Jobs API / redeploy)
             spark_conf:
               spark.databricks.cluster.profile: singleNode
               spark.master: "local[*]"
             custom_tags:
               ResourceClass: SingleNode
               work_type: prs_score
+            enable_elastic_disk: true
+
+        # Synthetic sample-axis fan-out only: fixed worker count makes benchmark runtime/cost
+        # reproducible. This is a streaming Spark join/write, not gVCF parsing; standard-memory
+        # local-SSD nodes are sufficient and avoid paying for high-memory extract drivers.
+        - job_cluster_key: prs_fanout_cluster
+          new_cluster:
+            spark_version: 15.4.x-scala2.12
+            node_type_id: ${var.prs_fanout_node_type}
+            driver_node_type_id: ${var.prs_fanout_node_type}
+            data_security_mode: SINGLE_USER
+            runtime_engine: STANDARD
+            num_workers: ${var.prs_fanout_num_workers}
+            custom_tags:
+              ResourceClass: MultiNode
+              work_type: prs_synthetic_fanout
             enable_elastic_disk: true
 
       tags: ${var.common_resource_tags}

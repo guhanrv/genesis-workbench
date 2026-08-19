@@ -96,6 +96,19 @@ CREATE TABLE IF NOT EXISTS sample_ancestry (
 ) USING DELTA
 """)
 
+# 7. Synthetic scale-test control plane. This stores no genotype values; it records which
+# deterministic manifest batches completed so retries and benchmark audits are unambiguous.
+spark.sql("""
+CREATE TABLE IF NOT EXISTS synthetic_fanout_ledger (
+    scale_run_id STRING, batch_id STRING, phase STRING, source_fingerprint STRING,
+    n_samples BIGINT, n_rows BIGINT, status STRING, completed_at TIMESTAMP
+) USING DELTA
+""")
+spark.sql("""
+ALTER TABLE synthetic_fanout_ledger
+SET TBLPROPERTIES ('data_classification' = 'SYNTHETIC_TEST_METADATA')
+""")
+
 # COMMAND ----------
 
 # MAGIC %md
@@ -121,7 +134,10 @@ for t, desc in _PHI.items():
 
 # COMMAND ----------
 
-for t in ["pgs_registry", "pgs_weights", "pgs_panel_ref", "dosage", "prs_scores", "sample_ancestry"]:
-    n = spark.table(t).count()
-    print(f"  {catalog}.{schema}.{t}: exists, {n} rows")
+for t in ["pgs_registry", "pgs_weights", "pgs_panel_ref", "dosage", "prs_scores",
+          "sample_ancestry", "synthetic_fanout_ledger"]:
+    # Never full-count genotype-scale tables during idempotent setup. At the 100k rung dosage can
+    # contain trillions of rows; a cosmetic COUNT would become the most expensive setup operation.
+    assert spark.catalog.tableExists(t)
+    print(f"  {catalog}.{schema}.{t}: ready")
 print("PRS stores ready.")

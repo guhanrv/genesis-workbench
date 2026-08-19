@@ -39,12 +39,8 @@ dbutils.widgets.text("min_coverage_frac", "0.5", "After extraction, fail if any 
 catalog = dbutils.widgets.get("catalog")
 schema = dbutils.widgets.get("schema")
 
-# COMMAND ----------
-
-# MAGIC %pip install pysam==0.22.1
-# MAGIC dbutils.library.restartPython()
-
-# COMMAND ----------
+# `pysam==0.22.1` is installed declaratively by the extract task's job library.
+# Keeping dependency installation out of the notebook avoids a Python restart and cold-run mutation.
 
 import os
 import glob
@@ -300,7 +296,22 @@ stage = spark.table("_dosage_stage")
 
 n_rows = spark.table("dosage").count()
 n_s = spark.table("dosage").select("sample_id").distinct().count()
+_extracted_sids = [s for (s, _) in manifest]
 print(f"dosage: {n_rows:,} rows across {n_s} sample(s)")
+
+# Fail-loud empty PGS overlap: a chrom-prefix / 0-vs-1-based / allele-convention mismatch joins
+# zero weight rows and would emit plausible-looking zero-coverage scores. Require at least one
+# shared variant_id with registered pgs_weights for the samples just extracted.
+_w = spark.table("pgs_weights").select("variant_id").distinct()
+_d = (spark.table("dosage").where(F.col("sample_id").isin(_extracted_sids))
+      .select("variant_id").distinct())
+_n_overlap = _d.join(_w, "variant_id").limit(1).count()
+if _n_overlap == 0:
+    raise ValueError(
+        "Extracted dosage shares NO variant_id with pgs_weights. Scoring would produce "
+        "silent zero-coverage PRS (likely chr prefix, coordinate, or effect/other convention "
+        "mismatch). Fix the keys before scoring.")
+print("PGS overlap: at least one extracted variant_id matches pgs_weights")
 
 # COMMAND ----------
 

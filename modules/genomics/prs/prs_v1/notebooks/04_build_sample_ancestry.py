@@ -25,6 +25,9 @@
 dbutils.widgets.text("catalog", "genesis_workbench", "Catalog")
 dbutils.widgets.text("schema", "genesis_schema", "Schema")
 dbutils.widgets.text("basis_path", "", "Volume path to pca_basis.npz (from pca_v1/ref_01_build_basis)")
+dbutils.widgets.text("pca_model_name", "ancestry_pca", "UC ancestry_pca name (@champion); empty = npz-only")
+dbutils.widgets.text("classifier_model_name", "ancestry_classifier", "UC ancestry_classifier name (@champion)")
+dbutils.widgets.text("model_alias", "champion", "Registry alias for the ancestry models")
 dbutils.widgets.text("vcf_dir", "", "Dir of gVCFs (each *.vcf.gz / *.g.vcf.gz = one sample)")
 dbutils.widgets.text("vcf_paths", "", "Explicit gVCF paths (comma-sep; overrides vcf_dir)")
 dbutils.widgets.text("fasta_path", "", "GRCh38 FASTA (.fna.bgz) for REF-block resolution")
@@ -37,15 +40,8 @@ dbutils.widgets.text("min_coverage_frac", "0.1", "Fraction of basis loci a sampl
 catalog = dbutils.widgets.get("catalog")
 schema = dbutils.widgets.get("schema")
 
-# COMMAND ----------
-
-# MAGIC # Pinned for reproducibility: scikit-learn/scipy are the DBR 15.4 LTS versions (RF ancestry +
-# MAGIC # Mahalanobis must not drift across releases even at fixed random_state); pysam pinned so
-# MAGIC # record.alts/.stop semantics the dose kernel relies on stay fixed.
-# MAGIC %pip install pysam==0.22.1 scikit-learn==1.3.0 scipy==1.11.1
-# MAGIC dbutils.library.restartPython()
-
-# COMMAND ----------
+# Pinned task libraries in prs_scoring.job.yml provide pysam, scikit-learn, scipy, and
+# mlflow. Declarative cluster libraries avoid notebook-side installs and restartPython.
 
 import os
 import glob
@@ -61,13 +57,16 @@ from delta.tables import DeltaTable
 catalog = dbutils.widgets.get("catalog")
 schema = dbutils.widgets.get("schema")
 basis_path = dbutils.widgets.get("basis_path").strip()
+pca_model_name = dbutils.widgets.get("pca_model_name").strip()
+classifier_model_name = dbutils.widgets.get("classifier_model_name").strip()
+model_alias = dbutils.widgets.get("model_alias").strip() or "champion"
 vcf_dir = dbutils.widgets.get("vcf_dir")
 vcf_paths_arg = dbutils.widgets.get("vcf_paths")
 fasta_path = dbutils.widgets.get("fasta_path")
 fasta_ref_cache_dir = dbutils.widgets.get("fasta_ref_cache_dir").strip()
 shard_by_chrom = dbutils.widgets.get("shard_by_chrom").strip().lower() == "true"
 reclassify = dbutils.widgets.get("reclassify").strip().lower() == "true"
-outlier_alpha = float(dbutils.widgets.get("outlier_alpha"))          # read post-restartPython
+outlier_alpha = float(dbutils.widgets.get("outlier_alpha"))
 min_coverage_frac = float(dbutils.widgets.get("min_coverage_frac"))
 
 spark.sql(f"USE CATALOG {catalog}")
@@ -77,12 +76,12 @@ spark.sql(f"USE SCHEMA {schema}")
 # prs_ancestry keeps sklearn/scipy imports INSIDE classify_ancestry/fit_rf, so importing it on a
 # (numpy-only) executor for project_member is safe — no sklearn needed out there.
 lib_dir = os.path.abspath(os.path.join(os.getcwd(), "..", "lib"))
-for m in ("gvcf_dose.py", "prs_extract.py", "prs_ancestry.py"):
+for m in ("gvcf_dose.py", "prs_extract.py", "fraposa.py"):
     spark.sparkContext.addPyFile(os.path.join(lib_dir, m))
 import sys; sys.path.append(lib_dir)
 import gvcf_dose as kern
 import prs_extract as ext
-import prs_ancestry as anc
+import fraposa as anc
 
 # COMMAND ----------
 
@@ -250,7 +249,7 @@ PROJ_SCHEMA = StructType(
 )
 
 def _project(pdf):
-    import numpy as _np, prs_ancestry as _a
+    import numpy as _np, fraposa as _a
     sid = pdf["sample_id"].iloc[0]
     idx = VIDX_B.value; N = len(idx)
     Xu = _np.full(N, _np.nan, dtype=_np.float32)
@@ -263,9 +262,53 @@ def _project(pdf):
     return pd.DataFrame([[sid, *[float(pc[k]) for k in range(len(PC_COLS))], ncov]],
                         columns=["sample_id", *PC_COLS, "n_covered"])
 
-proj = dose.groupBy("sample_id").applyInPandas(_project, schema=PROJ_SCHEMA)
-proj_rows = proj.collect()   # (n_samples × ~dim_ref) — tiny, safe to collect even at biobank scale
-print(f"projected {len(proj_rows)} sample(s)")
+# Prefer registered pyfuncs when @champion exists (fit/serve share featurize_to_basis).
+# gVCF extract above is unchanged — models only replace the npz project + driver RF.
+_use_models = False
+_pca_m = _clf_m = None
+if pca_model_name and classifier_model_name:
+    try:
+        import mlflow
+        mlflow.set_registry_uri("databricks-uc")
+        _pca_uri = f"models:/{catalog}.{schema}.{pca_model_name}@{model_alias}"
+        _clf_uri = f"models:/{catalog}.{schema}.{classifier_model_name}@{model_alias}"
+        _pca_m = mlflow.pyfunc.load_model(_pca_uri)
+        _clf_m = mlflow.pyfunc.load_model(_clf_uri)
+        _use_models = True
+        print(f"ancestry serve: {_pca_uri} + {_clf_uri}")
+    except Exception as e:
+        print(f"ancestry serve: models not loaded ({e}); npz + fraposa fallback")
+
+if _use_models:
+    from pyspark.sql.functions import struct as _struct
+    pairs = (dose.select("sample_id", _struct("variant_id", "dose").alias("p"))
+             .groupBy("sample_id").agg(F.collect_list("p").alias("pairs")))
+    pdf = pairs.toPandas()
+    model_in = pd.DataFrame({
+        "sample_id": pdf["sample_id"],
+        "variant_ids": [[t["variant_id"] for t in row] for row in pdf["pairs"]],
+        "doses": [[float(t["dose"]) for t in row] for row in pdf["pairs"]],
+    })
+    pcs_out = _pca_m.predict(model_in[["variant_ids", "doses"]])
+    clf_in = pcs_out.copy()
+    if "coverage_frac" in clf_in.columns:
+        pass
+    clf_out = _clf_m.predict(clf_in)
+    proj_rows = []
+    for i, sid in enumerate(model_in["sample_id"]):
+        rec = {"sample_id": sid, "n_covered": int(round(float(pcs_out.iloc[i].get("coverage_frac", 0)) * n_loci))}
+        for k in range(dim_ref):
+            rec[f"pc{k}"] = float(pcs_out.iloc[i].get(f"pc{k+1}", float("nan")))
+        rec["_msp"] = clf_out.iloc[i]["most_similar_pop"]
+        rec["_rf_probs"] = clf_out.iloc[i]["rf_probs"]
+        rec["_mahalanobis_p"] = float(clf_out.iloc[i]["mahalanobis_p"])
+        rec["_is_outlier"] = bool(clf_out.iloc[i]["is_outlier"])
+        proj_rows.append(rec)
+    print(f"projected {len(proj_rows)} sample(s) via @champion models")
+else:
+    proj = dose.groupBy("sample_id").applyInPandas(_project, schema=PROJ_SCHEMA)
+    proj_rows = proj.collect()
+    print(f"projected {len(proj_rows)} sample(s) via npz + fraposa")
 
 # COMMAND ----------
 
@@ -280,7 +323,6 @@ import json
 from scipy.stats import chi2
 
 N_PCS = 5  # pgsc_calc classifies on 5 PCs
-clf, cov = anc.fit_rf(pcs_ref, superpops, n_pcs=N_PCS)   # once, on the driver
 
 # Provenance: RF/Mahalanobis results depend on the sklearn/scipy versions, so record the versions the
 # classification actually ran under (pins live in the %pip cell; this captures what truly loaded).
@@ -290,27 +332,31 @@ def _ver(mod):
     except Exception:
         return "unknown"
 _lib_versions = json.dumps({"scikit-learn": _ver("sklearn"), "scipy": _ver("scipy"),
-                            "pysam": _ver("pysam"), "numpy": _ver("numpy")})
+                            "pysam": _ver("pysam"), "numpy": _ver("numpy"),
+                            "serve": "pyfunc" if _use_models else "npz+fraposa"})
 print("classifier lib versions:", _lib_versions)
 
-# is_outlier gate: RF argmax ALWAYS returns a superpop, even for a sample that belongs to no
-# reference population (non-human/contaminated, an ancestry absent from HGDP+1kGP) or that covers
-# almost no basis loci (projects to ~origin). Flag those so the scorer refuses to report a calibrated
-# z against the wrong panel, instead of silently normalizing. Two independent triggers:
-#   - PC-space outlier: Mahalanobis_P_ALL < outlier_alpha (sample far from every superpop cloud)
-#   - low coverage: covered/basis < min_coverage_frac (projection is unreliable / near-origin)
 out_rows = []
-for r in proj_rows:
-    pc5 = np.array([r[f"pc{k}"] for k in range(N_PCS)], dtype=np.float64)[None, :]
-    probs = clf.predict_proba(pc5)[0]
-    msp = str(clf.classes_[int(np.argmax(probs))])
-    d2 = float(cov.mahalanobis(pc5)[0])
-    p_all = float(chi2.sf(d2, N_PCS))                      # df = n_pcs (was N_PCS-1, a bug)
-    cov_frac = (int(r["n_covered"]) / n_loci) if n_loci else 0.0
-    is_outlier = bool(p_all < outlier_alpha or cov_frac < min_coverage_frac)
-    rf_probs = {str(c): float(p) for c, p in zip(clf.classes_, probs)}
-    out_rows.append((r["sample_id"], msp, p_all, int(r["n_covered"]), n_loci,
-                     panel_version, json.dumps(rf_probs), is_outlier, _lib_versions))
+if _use_models:
+    for rec in proj_rows:
+        cov_frac = (int(rec["n_covered"]) / n_loci) if n_loci else 0.0
+        is_outlier = bool(rec["_is_outlier"])
+        out_rows.append((rec["sample_id"], rec["_msp"], rec["_mahalanobis_p"],
+                         int(rec["n_covered"]), n_loci, panel_version,
+                         rec["_rf_probs"], is_outlier, _lib_versions))
+else:
+    clf, cov = anc.fit_rf(pcs_ref, superpops, n_pcs=N_PCS)   # once, on the driver
+    for r in proj_rows:
+        pc5 = np.array([r[f"pc{k}"] for k in range(N_PCS)], dtype=np.float64)[None, :]
+        probs = clf.predict_proba(pc5)[0]
+        msp = str(clf.classes_[int(np.argmax(probs))])
+        d2 = float(cov.mahalanobis(pc5)[0])
+        p_all = float(chi2.sf(d2, N_PCS))
+        cov_frac = (int(r["n_covered"]) / n_loci) if n_loci else 0.0
+        is_outlier = bool(p_all < outlier_alpha or cov_frac < min_coverage_frac)
+        rf_probs = {str(c): float(p) for c, p in zip(clf.classes_, probs)}
+        out_rows.append((r["sample_id"], msp, p_all, int(r["n_covered"]), n_loci,
+                         panel_version, json.dumps(rf_probs), is_outlier, _lib_versions))
 
 OUT_SCHEMA = StructType([
     StructField("sample_id", StringType()),

@@ -164,7 +164,7 @@ Genesis Workbench ships open models and open datasets across all modules. Models
 
 ### Datasets
 
-All datasets below are open/public (UniProt CC-BY 4.0, PDB/ClinVar/1000G public domain, CC-BY 4.0 cell atlases, etc.).
+All datasets below are open/public (UniProt CC-BY 4.0, PDB/ClinVar/1000G public domain, CC-BY 4.0 cell atlases, etc.). CC-BY 4.0 sources require attribution in derived publications.
 
 | Dataset | Use | is Vector Index |
 |---|---|---|
@@ -177,6 +177,9 @@ All datasets below are open/public (UniProt CC-BY 4.0, PDB/ClinVar/1000G public 
 | ACMG SF v3.2 gene panel | genomics — 81 medically-actionable genes for pathogenic-variant flagging | No |
 | GRCh38 reference genome (1000 Genomes/EBI) | genomics — alignment + variant normalization | No |
 | 1000 Genomes sample VCF (chr6) | genomics — GWAS demo input | No |
+| pgsc HGDP+1kGP reference panel (PGS Catalog, CC-BY 4.0) | genomics / pca — ancestry PCA basis + population classifier training set | No |
+| PGS Catalog scoring files (CC-BY 4.0) | genomics / prs — per-variant polygenic score weights | No |
+| Genome in a Bottle benchmark VCFs (NIST) | genomics / pca+prs — optional example scoring input | No |
 | MSK SPECTRUM HGSOC scRNA-seq (CellxGene) | single_cell — ovarian-cancer demo dataset | No |
 | Adams et al. 2020 lung scRNA-seq (Zenodo) | single_cell / scimilarity — IPF/healthy lung query sample | No |
 | Ensembl gene reference (BioMart) | single_cell — Ensembl ID ↔ gene-symbol mapping | No |
@@ -184,6 +187,13 @@ All datasets below are open/public (UniProt CC-BY 4.0, PDB/ClinVar/1000G public 
 | AlphaFold genetic DBs — UniRef90, UniRef30, MGnify, small BFD, PDB70, PDB mmCIF, pdb_seqres, UniProt | large_molecule / alphafold — MSA + template search for folding | No |
 
 > The three vector indexes are served from Databricks Vector Search: `gene_sequence_embedding_index` and `sequence_embedding_index` (protein similarity) plus `scimilarity_cell_index` (cell similarity). Protein search queries the human and UniRef indexes together so a single query returns both human and broad-organism hits.
+
+**Citations — genomics PCA/PRS.** Cite these in publications derived from the ancestry/polygenic-score pipelines:
+
+- **PGS Catalog** (reference panel + all scoring files) — Lambert SA, et al. *Nat Genet* 53:420–425 (2021). [doi:10.1038/s41588-021-00783-5](https://doi.org/10.1038/s41588-021-00783-5). Each PGS also carries its own source publication, listed at `pgscatalog.org/score/<PGS_ID>/`.
+- **Reference-panel cohorts** — 1000 Genomes Project Consortium. *Nature* 526:68–74 (2015). [doi:10.1038/nature15393](https://doi.org/10.1038/nature15393) · Bergström A, et al. *Science* 367:eaay5012 (2020). [doi:10.1126/science.aay5012](https://doi.org/10.1126/science.aay5012)
+- **Ancestry method** (FRAPOSA) — Zhang D, Dey R, Lee S. *Bioinformatics* 36(11):3439–3446 (2020). [doi:10.1093/bioinformatics/btaa152](https://doi.org/10.1093/bioinformatics/btaa152)
+- **Genome in a Bottle** (if GIAB samples were used) — Zook JM, et al. *Sci Data* 3:160025 (2016). [doi:10.1038/sdata.2016.25](https://doi.org/10.1038/sdata.2016.25)
 
 ## $${\color{orange}Changelog}$$
 See [CHANGELOG.md](CHANGELOG.md) for deployment fixes, known issues, and configuration notes.
@@ -410,6 +420,15 @@ MHCflurry | databricks-sql-connector==4.0.2 | Apache2.0 | https://github.com/dat
 MHCflurry | MODEL WEIGHTS (auto-fetched via `mhcflurry-downloads fetch models_class1_presentation`, ~150 MB) | Apache2.0 | https://github.com/openvax/mhcflurry
 Genomics | glow | Apache2.0 | https://github.com/projectglow/glow
 Genomics | pyspark | Apache2.0 | https://github.com/apache/spark
+Genomics (PCA/PRS) | pgenlib==0.94.1 | LGPL-3.0 | https://github.com/chrchang/plink-ng
+Genomics (PCA/PRS) | zstandard==0.23.0 | BSD-3 | https://github.com/indygreg/python-zstandard
+Genomics (PCA/PRS) | scikit-learn==1.3.0 | BSD-3 | https://github.com/scikit-learn/scikit-learn
+Genomics (PCA/PRS) | scipy==1.11.1 | BSD-3 | https://github.com/scipy/scipy
+Genomics (PCA/PRS) | mlflow==2.22.0 | Apache2.0 | https://github.com/mlflow/mlflow
+Genomics (PCA/PRS) | FRAPOSA — ancestry PCA / OADP projection; adapted source, license + modifications in `modules/genomics/pca/pca_v1/lib/fraposa.py` | MIT | https://github.com/daviddaiweizhang/fraposa
+Genomics (PCA/PRS) | pgsc_calc — RF + Mahalanobis ancestry classifier; adapted source in `fraposa.py` | Apache2.0 | https://github.com/PGScatalog/pgsc_calc
+Genomics (PCA/PRS) | DATASET — pgsc HGDP+1kGP ancestry reference panel (auto-fetched; not redistributed) | CC BY 4.0 | https://www.pgscatalog.org/terms/
+Genomics (PCA/PRS) | DATASET — PGS Catalog scoring files (auto-fetched; not redistributed) | CC BY 4.0 | https://www.pgscatalog.org/terms/
 BioNeMo | six==1.16.0 | MIT | https://github.com/benjaminp/six
 BioNeMo | numpy==1.26.4 | BSD-3 | https://github.com/numpy/numpy
 BioNeMo | pandas==2.2.3 | BSD-3 | https://github.com/pandas-dev/pandas

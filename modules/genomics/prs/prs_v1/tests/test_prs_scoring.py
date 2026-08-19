@@ -106,9 +106,16 @@ def test_scorer_restricts_to_panel_matched_set():
     pgs_panel_afreq). A left-join lets the member sum off-panel variants the panel never scored →
     raw on a larger scale than the panel distribution → inflated z. Guard the inner join."""
     src = _SCORER.read_text()
-    assert '.join(afreq, "variant_id", "inner")' in src, (
+    assert 'join(afreq, "variant_id", "inner")' in src, (
         "05_score_prs mean_impute path must inner-join afreq (restrict member to the panel-matched set).")
 
+
+def test_scorer_supports_pgs_chunking():
+    src = _SCORER.read_text()
+    assert 'dbutils.widgets.text("pgs_chunk_size"' in src
+    assert 'dbutils.widgets.text("max_weight_rows_per_chunk"' in src
+    assert "chunk_by_weight_budget" in src
+    assert "broadcast_wts" in src
 
 def score_mean_impute(weights, panel_af, member_dose):
     """Pure-Python reference of the scorer's mean_impute aggregate (the calibrated path).
