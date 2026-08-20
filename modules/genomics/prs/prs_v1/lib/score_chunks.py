@@ -1,8 +1,10 @@
-"""PGS-axis chunking helpers for ``05_score_prs``.
+"""Chunking helpers for ``05_score_prs``.
 
-Full-catalog mean_impute densifies ``plan ⋈ weights ⋈ afreq`` before joining dose.
-At ~337M weight rows that join shuffles tens–hundreds of GB on a single node.
-Chunking bounds each densify so weights can broadcast (or at least SMJ a smaller set).
+**Sample axis (preferred):** mean_impute densifies ``plan ⋈ weights ⋈ afreq`` per
+sample. n=10 × 197 PGS was a ~164 GB shuffle with no spill; n=100 wrote ~1.5 TB
+and spilled ~3 TB. ``chunk_fixed(sample_ids, 10)`` keeps each join in the n=10
+shape. PGS-axis packing is kept for experiments but lost a 4.4× A/B at n=10
+(re-reads dosage once per PGS chunk).
 """
 from __future__ import annotations
 

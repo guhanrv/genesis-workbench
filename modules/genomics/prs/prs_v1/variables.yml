@@ -32,6 +32,13 @@ variables:
       Do not autoscale: compare 10/1k/10k on the same fleet.
     default: 4
 
+  prs_score_num_workers:
+    description: >-
+      Worker count for prs_score_cluster. 4 is the n=10/n=100 A/B lock (7× wall vs
+      single-node at n=10; sample batches of 10 need executor parallelism). 0 is not
+      used — this cluster is multi-node (no singleNode profile).
+    default: 4
+
   t4_node_type:
     description: Node type for T4 GPUs
 

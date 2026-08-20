@@ -236,8 +236,10 @@ resources:
         # score_prs — PGS-axis chunking (bounds mean_impute densify / shuffle)
         - name: pgs_chunk_size           # >0 = fixed # PGS per chunk; 0 = use weight budget
           default: "0"
-        - name: max_weight_rows_per_chunk  # when pgs_chunk_size=0; 0 = all-at-once (keep until A/B wins)
+        - name: max_weight_rows_per_chunk  # when pgs_chunk_size=0; 0 = no PGS chunking
           default: "0"
+        - name: sample_chunk_size          # max samples per densify join; 0 = all-at-once
+          default: "10"
         - name: missing_mode
           default: "mean_impute"
 
@@ -279,14 +281,13 @@ resources:
           new_cluster:
             spark_version: 15.4.x-scala2.12
             node_type_id: ${var.cpu_node_type}
+            driver_node_type_id: ${var.cpu_node_type}
             data_security_mode: SINGLE_USER
             runtime_engine: STANDARD
-            num_workers: 0                          # TITRATE UP after PGS-chunk A/B (Jobs API / redeploy)
-            spark_conf:
-              spark.databricks.cluster.profile: singleNode
-              spark.master: "local[*]"
+            # n=10 W4: 7× wall vs 1 node. n=100 sample_chunk=10: 64 min, 0 spill on 4 workers.
+            num_workers: ${var.prs_score_num_workers}
             custom_tags:
-              ResourceClass: SingleNode
+              ResourceClass: MultiNode
               work_type: prs_score
             enable_elastic_disk: true
 

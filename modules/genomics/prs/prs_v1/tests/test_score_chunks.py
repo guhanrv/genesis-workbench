@@ -33,3 +33,12 @@ def test_weight_budget_packs_and_isolates_oversize():
 def test_weight_budget_disabled():
     rows = [{"pgs_id": "a", "n_weights": 1}, {"pgs_id": "b", "n_weights": 1}]
     assert chunk_by_weight_budget(rows, max_weight_rows=0) == [rows]
+
+
+def test_sample_chunks_of_ten():
+    ids = [f"s{i:03d}" for i in range(1, 101)]
+    chunks = chunk_fixed(ids, 10)
+    assert len(chunks) == 10
+    assert chunks[0] == ids[:10]
+    assert chunks[-1] == ids[-10:]
+    assert chunk_fixed(ids, 0) == [ids]

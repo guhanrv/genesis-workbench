@@ -40,8 +40,9 @@ sandbox without a governance decision. The reference panel (HGDP+1kGP) and any f
 
 ## What it deploys — the `prs_scoring` job
 
-Six tasks, all on **classic** job clusters (fixed `num_workers`, started minimal + titrated;
-**never serverless** — its unbounded autoscale is the #1 bill risk). Ephemeral (auto-terminate).
+Six tasks, all on **classic** job clusters (**never serverless** — unbounded autoscale is
+the #1 bill risk). Light/extract start single-node; **`prs_score_cluster` is 4 workers**
+(n=10/n=100 A/B). Fan-out is a separate 4-worker cluster, skipped in production. Ephemeral.
 
 ```
 setup_stores → register → extract_dosage → build_sample_ancestry
@@ -58,7 +59,7 @@ setup_stores → register → extract_dosage → build_sample_ancestry
   `confirm_synthetic_fanout=true`. Extracts each canonical gVCF once, then uses bounded Spark
   batches to copy canonical dosage/ancestry rows to synthetic logical IDs. This measures Delta,
   reconcile, and scoring scale without creating duplicate gVCFs or rereading one file N times.
-- **`05_score_prs`** — SQL join-aggregate over the reconcile plan → `raw`, then reference-panel `z_msp` + RF-posterior-weighted `z_admixed` → MERGE `prs_scores`. Default `missing_mode=mean_impute` (`pgs_panel_afreq` 2·AF). Optional PGS-axis chunking is off by default (n=10 A/B: 3M budget was 4.4× slower).
+- **`05_score_prs`** — SQL join-aggregate over the reconcile plan → `raw`, then reference-panel `z_msp` + RF-posterior-weighted `z_admixed` → MERGE `prs_scores`. Default `missing_mode=mean_impute`. Default `sample_chunk_size=10` (n=100 all-at-once spilled; n=10 did not). Optional PGS-axis chunking stays off.
 - **`06_save_results`** — read `prs_scores` → log cohort summary metrics (coverage, z_msp/z_admixed counts, raw distribution) to the MLflow run. `mark_success` / `mark_failure` then set the run's `job_status` (framework convention).
 
 ## Two ingest engines (both write the shared `dosage` store)
@@ -84,7 +85,8 @@ setup_stores → register → extract_dosage → build_sample_ancestry
 | `basis_path` | `pca_basis.npz` for ancestry (default `${var.prs_pca_basis}`) |
 | `apply` / `max_cells` / `confirm_large` | reconcile guardrails — **dry-run by default** |
 | `missing_mode` | `mean_impute` (default; 2·AF from `pgs_panel_afreq`) or `drop` |
-| `pgs_chunk_size` / `max_weight_rows_per_chunk` | bound mean_impute densify; both default `0` (all-at-once). `pgs_chunk_size>0` = fixed PGS/chunk; else a weight-row budget if set |
+| `pgs_chunk_size` / `max_weight_rows_per_chunk` | PGS-axis bound (default off; n=10 A/B was slower) |
+| `sample_chunk_size` | max samples per densify join (default **10**, the no-spill shape; `0` = all-at-once) |
 | `sample_manifest_path` / `confirm_synthetic_fanout` | synthetic-only sample-axis benchmark; empty/false in production |
 | `fanout_batch_size` / `max_fanout_rows` | bounded fan-out writes and pre-write row-count kill switch |
 

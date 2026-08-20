@@ -117,6 +117,14 @@ def test_scorer_supports_pgs_chunking():
     assert "chunk_by_weight_budget" in src
     assert "broadcast_wts" in src
 
+
+def test_scorer_defaults_sample_chunk_size_ten():
+    """n=100 all-at-once spilled ~1.5 TB; n=10 on 4 workers did not. Default
+    sample batches of 10 keep densify in the measured no-spill shape."""
+    src = _SCORER.read_text()
+    assert 'dbutils.widgets.text("sample_chunk_size", "10"' in src
+    assert "sample_chunk_size" in src
+
 def score_mean_impute(weights, panel_af, member_dose):
     """Pure-Python reference of the scorer's mean_impute aggregate (the calibrated path).
 

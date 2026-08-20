@@ -12,9 +12,12 @@
 # MAGIC ```
 # MAGIC Runs on a classic cluster started minimal + titrated (see job.yml). MERGE-upserts the flat `prs_scores`.
 # MAGIC
-# MAGIC **PGS chunking:** large planned weight unions densify into multi‑GB shuffles under `mean_impute`.
-# MAGIC Set `pgs_chunk_size` (>0) or `max_weight_rows_per_chunk` to bound each join; within a chunk that
-# MAGIC fits `WEIGHTS_BROADCAST_MAX_ROWS`, weights are force-broadcast so dose streams.
+# MAGIC **Sample-axis chunking (default 10):** n=10 × 197 PGS densify was ~164 GB shuffle
+# MAGIC with no spill on 4 workers; n=100 all-at-once wrote ~1.5 TB and spilled ~3 TB.
+# MAGIC Each sample batch re-filters `dosage` (Liquid Clustering file-skip) so the join
+# MAGIC stays in the measured no-spill shape. Set `sample_chunk_size=0` for all-at-once.
+# MAGIC PGS-axis chunking (`pgs_chunk_size` / `max_weight_rows_per_chunk`) is optional and
+# MAGIC default-off — a 3M weight budget was 4.4× slower at n=10 (re-reads dosage).
 
 # COMMAND ----------
 
@@ -28,11 +31,14 @@ dbutils.widgets.text("missing_mode", "mean_impute", "mean_impute = missing→2·
 # 0 = score the full planned PGS set in one join (legacy / baseline A/B). >0 = fixed PGS count per chunk.
 dbutils.widgets.text("pgs_chunk_size", "0", "Fixed # PGS per score chunk (0 = use weight budget or all-at-once)")
 # When pgs_chunk_size=0: greedy-pack PGS until Σ weight rows hits this budget. 0 disables packing.
-dbutils.widgets.text("max_weight_rows_per_chunk", "0", "Weight-row budget per chunk when pgs_chunk_size=0 (0 = no chunking / all-at-once)")
+dbutils.widgets.text("max_weight_rows_per_chunk", "0", "Weight-row budget per chunk when pgs_chunk_size=0 (0 = no PGS chunking)")
+# 0 = all planned samples in one join (n=100 spilled). 10 = measured no-spill shape.
+dbutils.widgets.text("sample_chunk_size", "10", "Max samples per score join (0 = all-at-once)")
 catalog = dbutils.widgets.get("catalog"); schema = dbutils.widgets.get("schema")
 missing_mode = dbutils.widgets.get("missing_mode").strip().lower()
 pgs_chunk_size = int(dbutils.widgets.get("pgs_chunk_size") or "0")
 max_weight_rows_per_chunk = int(dbutils.widgets.get("max_weight_rows_per_chunk") or "0")
+sample_chunk_size = int(dbutils.widgets.get("sample_chunk_size") or "0")
 
 # COMMAND ----------
 
@@ -64,18 +70,16 @@ planned_pgs = plan.select("pgs_id", "weight_sha").distinct()
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ### 0. Dose prune + PGS chunk plan
-# MAGIC Dose is loaded once; each chunk filters plan/weights and MERGE-upserts independently.
+# MAGIC ### 0. Sample batches + optional PGS chunks
+# MAGIC Each sample batch file-skips `dosage` and MERGE-upserts independently.
 
 # COMMAND ----------
 
 WEIGHTS_BROADCAST_MAX_ROWS = 3_000_000
-SAMPLE_PREDICATE_MAX = 200
-_planned_ids = [r["sample_id"] for r in planned_samples.limit(SAMPLE_PREDICATE_MAX + 1).collect()]
-if 0 < len(_planned_ids) <= SAMPLE_PREDICATE_MAX:
-    dose = spark.table("dosage").where(F.col("sample_id").isin(_planned_ids))
-else:
-    dose = spark.table("dosage").join(F.broadcast(planned_samples), "sample_id")
+SAMPLE_PREDICATE_MAX = 200  # isin() file-skip; larger batches use a broadcast sample join
+
+_sample_ids = [r["sample_id"] for r in planned_samples.select("sample_id").collect()]
+_sample_chunks = chunk_fixed(_sample_ids, sample_chunk_size)
 
 _use_impute = missing_mode == "mean_impute" and spark.catalog.tableExists("pgs_panel_afreq")
 if missing_mode == "mean_impute" and not _use_impute:
@@ -85,7 +89,14 @@ afreq = (
     spark.table("pgs_panel_afreq").select("variant_id", "af_effect")
     if _use_impute else None
 )
-dose_sv = dose.select("sample_id", "variant_id", F.col("dose").alias("_d"))
+
+
+def _dose_for_samples(sids):
+    """Prune dosage to one sample batch (Liquid Clustering file-skip when small)."""
+    if 0 < len(sids) <= SAMPLE_PREDICATE_MAX:
+        return spark.table("dosage").where(F.col("sample_id").isin(sids))
+    batch = spark.createDataFrame([(s,) for s in sids], schema="sample_id STRING")
+    return spark.table("dosage").join(F.broadcast(batch), "sample_id")
 
 # Weight counts for budget packing (cheap agg over planned PGS only).
 _wcount = (
@@ -111,12 +122,13 @@ else:
     _chunk_mode = "all_at_once"
 
 print(
-    f"score chunks: mode={_chunk_mode} n_pgs={len(_pgs_rows)} n_chunks={len(_chunks)} "
-    f"missing_mode={'mean_impute' if _use_impute else 'drop'}"
+    f"score chunks: samples={len(_sample_ids)} sample_batches={len(_sample_chunks)} "
+    f"(size={sample_chunk_size or 'all'}) pgs_mode={_chunk_mode} n_pgs={len(_pgs_rows)} "
+    f"n_pgs_chunks={len(_chunks)} missing_mode={'mean_impute' if _use_impute else 'drop'}"
 )
 for i, ch in enumerate(_chunks):
     print(
-        f"  chunk[{i}] n_pgs={len(ch)} n_weights={sum(int(r['n_weights']) for r in ch)} "
+        f"  pgs_chunk[{i}] n_pgs={len(ch)} n_weights={sum(int(r['n_weights']) for r in ch)} "
         f"pgs={[r['pgs_id'] for r in ch[:5]]}{'…' if len(ch) > 5 else ''}"
     )
 
@@ -148,8 +160,9 @@ def _norm_cdf_pct(z):
     return None if z is None else 100.0 * 0.5 * (1.0 + math.erf(float(z) / math.sqrt(2.0)))
 
 
-def _raw_agg(plan_c: DataFrame, wts_c: DataFrame, *, broadcast_wts: bool) -> DataFrame:
-    """Join-aggregate raw scores for one PGS chunk."""
+def _raw_agg(plan_c: DataFrame, wts_c: DataFrame, dose_c: DataFrame, *, broadcast_wts: bool) -> DataFrame:
+    """Join-aggregate raw scores for one (sample-batch × PGS-chunk)."""
+    dose_sv = dose_c.select("sample_id", "variant_id", F.col("dose").alias("_d"))
     if _use_impute:
         wts_panel = wts_c.join(afreq, "variant_id", "inner")
         _wp = F.broadcast(wts_panel) if broadcast_wts else wts_panel
@@ -167,7 +180,7 @@ def _raw_agg(plan_c: DataFrame, wts_c: DataFrame, *, broadcast_wts: bool) -> Dat
     else:
         _wts = F.broadcast(wts_c) if broadcast_wts else wts_c
         agg = (
-            dose.join(_wts, "variant_id")
+            dose_c.join(_wts, "variant_id")
             .groupBy("sample_id", "pgs_id", "weight_sha")
             .agg(
                 F.sum(F.col("dose") * F.col("weight")).alias("raw_score"),
@@ -241,39 +254,48 @@ def _normalize(raw: DataFrame) -> DataFrame:
 tgt = DeltaTable.forName(spark, f"{catalog}.{schema}.prs_scores")
 total_cells = 0
 t_all = time.time()
+n_joins = len(_sample_chunks) * len(_chunks)
+join_i = 0
 
-for ci, ch in enumerate(_chunks):
-    t0 = time.time()
-    chunk_keys = spark.createDataFrame(
-        [(r["pgs_id"], r["weight_sha"]) for r in ch],
-        schema="pgs_id STRING, weight_sha STRING",
+for si, sids in enumerate(_sample_chunks):
+    dose_c = _dose_for_samples(sids)
+    plan_s = plan.where(F.col("sample_id").isin(sids)) if len(sids) <= SAMPLE_PREDICATE_MAX else (
+        plan.join(F.broadcast(spark.createDataFrame([(s,) for s in sids], "sample_id STRING")), "sample_id")
     )
-    plan_c = plan.join(F.broadcast(chunk_keys), ["pgs_id", "weight_sha"])
-    wts_c = spark.table("pgs_weights").join(F.broadcast(chunk_keys), ["pgs_id", "weight_sha"])
-    n_w = sum(int(r["n_weights"]) for r in ch)
-    broadcastable = n_w <= WEIGHTS_BROADCAST_MAX_ROWS
-
-    out = _normalize(_raw_agg(plan_c, wts_c, broadcast_wts=broadcastable))
-    out.createOrReplaceTempView("_scored_chunk")
-    (
-        tgt.alias("t")
-        .merge(
-            spark.table("_scored_chunk").alias("s"),
-            "t.sample_id = s.sample_id AND t.pgs_id = s.pgs_id",
+    for ci, ch in enumerate(_chunks):
+        join_i += 1
+        t0 = time.time()
+        chunk_keys = spark.createDataFrame(
+            [(r["pgs_id"], r["weight_sha"]) for r in ch],
+            schema="pgs_id STRING, weight_sha STRING",
         )
-        .whenMatchedUpdateAll()
-        .whenNotMatchedInsertAll()
-        .execute()
-    )
-    n = spark.table("_scored_chunk").count()
-    total_cells += n
-    print(
-        f"chunk[{ci}/{len(_chunks)}] cells={n} n_pgs={len(ch)} n_weights={n_w} "
-        f"broadcast={broadcastable} wall_s={time.time() - t0:.1f}"
-    )
+        plan_c = plan_s.join(F.broadcast(chunk_keys), ["pgs_id", "weight_sha"])
+        wts_c = spark.table("pgs_weights").join(F.broadcast(chunk_keys), ["pgs_id", "weight_sha"])
+        n_w = sum(int(r["n_weights"]) for r in ch)
+        broadcastable = n_w <= WEIGHTS_BROADCAST_MAX_ROWS
+
+        out = _normalize(_raw_agg(plan_c, wts_c, dose_c, broadcast_wts=broadcastable))
+        out.createOrReplaceTempView("_scored_chunk")
+        (
+            tgt.alias("t")
+            .merge(
+                spark.table("_scored_chunk").alias("s"),
+                "t.sample_id = s.sample_id AND t.pgs_id = s.pgs_id",
+            )
+            .whenMatchedUpdateAll()
+            .whenNotMatchedInsertAll()
+            .execute()
+        )
+        n = spark.table("_scored_chunk").count()
+        total_cells += n
+        print(
+            f"join[{join_i}/{n_joins}] sample_batch={si} n_samples={len(sids)} "
+            f"pgs_chunk={ci} n_pgs={len(ch)} n_weights={n_w} cells={n} "
+            f"broadcast={broadcastable} wall_s={time.time() - t0:.1f}"
+        )
 
 print(
     f"scored + upserted {total_cells} (sample,pgs) cells into {catalog}.{schema}.prs_scores "
-    f"in {len(_chunks)} chunks ({time.time() - t_all:.1f}s)"
+    f"in {n_joins} joins ({time.time() - t_all:.1f}s)"
 )
 dbutils.notebook.exit(str(total_cells))

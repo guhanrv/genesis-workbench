@@ -12,8 +12,9 @@ dropping GWAS `pca_scores_table`. See `DIRECTION_B_CONTRACT.md`.
 
 **Synthetic PRS scale path (2026-08-19).** Optional `sample_manifest` fan-out copies canonical
 dosage/ancestry to reserved `synth_*` IDs (parse gVCF once). Guarded by
-`confirm_synthetic_fanout` + row cap. Optional PGS-axis chunking stays **off** by default
-(measured slower than all-at-once at n=10).
+`confirm_synthetic_fanout` + row cap. Scorer defaults: `sample_chunk_size=10` (n=100
+all-at-once spilled ~1.5 TB; batches of 10: 64 min, 0 spill, 2.8× fewer node-min) and
+`prs_score_cluster` **4 workers**. PGS-axis chunking stays off.
 
 Two new `genomics` submodules, both Spark/Glow-native (same modality as `gwas`; no PLINK / `pgsc_calc`),
 added to the genomics submodule list so each is deployable on its own
