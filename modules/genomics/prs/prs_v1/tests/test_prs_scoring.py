@@ -90,6 +90,8 @@ def test_score_samples_worked_example():
 import pathlib
 
 _SCORER = pathlib.Path(__file__).resolve().parent.parent / "notebooks" / "05_score_prs.py"
+_RECONCILE = pathlib.Path(__file__).resolve().parent.parent / "notebooks" / "03_reconcile.py"
+_EXTRACT = pathlib.Path(__file__).resolve().parent.parent / "notebooks" / "02_extract_dosage.py"
 
 
 def test_scorer_default_is_mean_impute():
@@ -116,6 +118,22 @@ def test_scorer_supports_pgs_chunking():
     assert 'dbutils.widgets.text("max_weight_rows_per_chunk"' in src
     assert "chunk_by_weight_budget" in src
     assert "broadcast_wts" in src
+
+
+def test_reconcile_does_not_distinct_dosage():
+    """dosage is ~17M rows/sample. Default sample universe must come from sample_ancestry
+    (1 row/id) or an explicit samples list — never SELECT DISTINCT sample_id FROM dosage."""
+    src = _RECONCILE.read_text()
+    assert 'spark.table("dosage")' not in src
+    assert 'spark.table("sample_ancestry")' in src
+    assert 'plan.select("sample_id").distinct().count()' not in src
+    assert 'plan.select("pgs_id").distinct().count()' not in src
+
+
+def test_extract_does_not_count_distinct_full_dosage():
+    src = _EXTRACT.read_text()
+    assert 'spark.table("dosage").select("sample_id").distinct()' not in src
+    assert 'spark.table("dosage").count()' not in src
 
 
 def test_scorer_defaults_sample_chunk_size_ten():

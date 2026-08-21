@@ -132,7 +132,15 @@ for p in paths:
 print(f"{len(manifest)} gVCF(s) found and validated (size/single-sample/build)")
 
 if not reextract and spark.catalog.tableExists("dosage"):
-    have = {r["sample_id"] for r in spark.table("dosage").select("sample_id").distinct().collect()}
+    _cands = [s for (s, _) in manifest]
+    have = {
+        r["sample_id"]
+        for r in (spark.table("dosage")
+                  .where(F.col("sample_id").isin(_cands))
+                  .select("sample_id")
+                  .dropDuplicates()
+                  .collect())
+    } if _cands else set()
     before = len(manifest)
     manifest = [(s, p) for (s, p) in manifest if s not in have]
     skipped = before - len(manifest)
@@ -294,10 +302,9 @@ stage = spark.table("_dosage_stage")
  .merge(stage.alias("s"), "t.sample_id = s.sample_id AND t.variant_id = s.variant_id")
  .whenMatchedUpdateAll().whenNotMatchedInsertAll().execute())
 
-n_rows = spark.table("dosage").count()
-n_s = spark.table("dosage").select("sample_id").distinct().count()
 _extracted_sids = [s for (s, _) in manifest]
-print(f"dosage: {n_rows:,} rows across {n_s} sample(s)")
+n_rows = stage.count()
+print(f"dosage merge: {n_rows:,} staged rows for {len(_extracted_sids)} sample(s) this run")
 
 # Fail-loud empty PGS overlap: a chrom-prefix / 0-vs-1-based / allele-convention mismatch joins
 # zero weight rows and would emit plausible-looking zero-coverage scores. Require at least one

@@ -17,7 +17,8 @@
 
 dbutils.widgets.text("catalog", "genesis_workbench", "Catalog")
 dbutils.widgets.text("schema", "genesis_schema", "Schema")
-dbutils.widgets.text("samples", "", "Sample ids (comma-sep; empty = all in dosage store)")
+dbutils.widgets.text("samples", "", "Sample ids (comma-sep; empty = all in sample_ancestry)")
+dbutils.widgets.text("sample_id_prefix", "", "If samples empty: keep sample_id starting with this")
 dbutils.widgets.text("pgs_ids", "", "PGS ids (comma-sep; empty = all registered)")
 dbutils.widgets.text("panel_version", "", "Panel version to score against (empty = latest in pgs_panel_ref)")
 dbutils.widgets.text("apply", "false", "false = dry-run (plan only); true = write runnable plan")
@@ -44,6 +45,7 @@ def _csv(name):
     return [x.strip() for x in v.split(",") if x.strip()] if v else None
 
 sample_filter = _csv("samples")
+sample_id_prefix = dbutils.widgets.get("sample_id_prefix").strip()
 pgs_filter = _csv("pgs_ids")
 panel_version = dbutils.widgets.get("panel_version").strip()
 
@@ -70,9 +72,14 @@ else:
               .groupBy("pgs_id").agg(F.max("panel_version").alias("panel_version")))
     registry = registry.join(pv_tbl, "pgs_id", "left")
 
-samples = spark.table("dosage").select("sample_id").distinct()
+# Sample universe is NEVER `SELECT DISTINCT sample_id FROM dosage` (17M+ rows/sample).
+# `sample_ancestry` is one row per scored member; an explicit `samples` list is a tiny DF.
 if sample_filter:
-    samples = samples.where(F.col("sample_id").isin(sample_filter))
+    samples = spark.createDataFrame([(s,) for s in sample_filter], ["sample_id"]).dropDuplicates()
+else:
+    samples = spark.table("sample_ancestry").select("sample_id")
+    if sample_id_prefix:
+        samples = samples.where(F.col("sample_id").startswith(sample_id_prefix))
 
 desired = samples.crossJoin(registry)
 if panel_version:
@@ -100,12 +107,12 @@ plan = (
 )
 
 n_cells = plan.count()
-n_samples = plan.select("sample_id").distinct().count()
-n_pgs = plan.select("pgs_id").distinct().count()
+n_universe = len(sample_filter) if sample_filter else samples.count()
+n_pgs = registry.count()
 est = f"{n_cells * dbu_per_cell:.2f} DBU" if dbu_per_cell > 0 else "UNCALIBRATED (run Stage-0 benchmark to set dbu_per_cell)"
 
 print("=" * 64)
-print(f"RECONCILE PLAN: {n_cells} cells to compute  ({n_samples} samples × {n_pgs} pgs touched)")
+print(f"RECONCILE PLAN: {n_cells} cells to compute  (universe={n_universe} samples × {n_pgs} registered pgs)")
 print(f"  estimated cost: {est}")
 print(f"  mode: {'APPLY' if apply else 'DRY-RUN (no plan written)'}   max_cells={max_cells}")
 print("=" * 64)
