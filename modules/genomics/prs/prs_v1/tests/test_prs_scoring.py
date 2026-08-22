@@ -136,6 +136,21 @@ def test_extract_does_not_count_distinct_full_dosage():
     assert 'spark.table("dosage").count()' not in src
 
 
+def test_scorer_does_not_recount_the_scored_view():
+    """`_scored_chunk` is a lazy plan over the whole densify join, so counting it after the
+    MERGE re-runs that join. Count the (small) plan instead — the row counts are equal."""
+    src = _SCORER.read_text()
+    assert 'spark.table("_scored_chunk").count()' not in src
+    assert "n = plan_c.count()" in src
+
+
+def test_scorer_shuffle_partitions_default_auto():
+    """`auto` is the measured no-spill setting; a pinned value is A/B-only."""
+    src = _SCORER.read_text()
+    assert 'dbutils.widgets.text("shuffle_partitions", "auto"' in src
+    assert 'spark.conf.set("spark.sql.shuffle.partitions", shuffle_partitions)' in src
+
+
 def test_scorer_defaults_sample_chunk_size_ten():
     """n=100 all-at-once spilled ~1.5 TB; n=10 on 4 workers did not. Default
     sample batches of 10 keep densify in the measured no-spill shape."""

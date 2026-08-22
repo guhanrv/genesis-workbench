@@ -54,6 +54,36 @@ n≥100 (1.5 TB shuffle / ~3 TB spill); `sample_chunk_size=25` at the 1k table
 | 4 workers, chunk=25 | 1k (125 cells) | 15,419 s then cancel | $13.04 | no — spill |
 | 4 workers, chunk=10 resume | 1k (875 new) | 32,653 s + 261 s setup | $27.43 | **yes** |
 
+## Efficiency A/Bs after the 1k run (all n=10, 1,970 cells, 4 workers, chunk=10)
+
+Cluster metrics on the 1k run averaged ~69% CPU / ~47% memory, which prompted
+three attempts to reclaim it. Only one paid.
+
+| Change | Exec | Verdict |
+|---|---|---|
+| Baseline (highmem, per-chunk `count()`, `auto`) | 517 s | reference (`172832081298152`) |
+| **Drop the redundant `count()` on `_scored_chunk`** | **478 s** | **keep** (`478649617650133`) |
+| `spark.sql.shuffle.partitions=512` instead of `auto` | 479 s | no effect — keep `auto` (`105283891455014`) |
+| **`c3d-standard-8-lssd` instead of highmem** | **FAILED at 733 s** | **never** (`91294737167468`) |
+
+**Node class is not a lever.** Standard-memory (~32 GB) executors die with JVM
+OOM (`ExecutorLostFailure … Command exited with code 52`) inside the densify
+join that highmem (~64 GB) runs with zero spill. The cluster stayed healthy —
+this is executor heap, not a node or capacity failure. The ~47% average memory
+is a whole-run, whole-cluster average including the driver and the gaps between
+chunks; peak inside the join is already above what a 32 GB box can offer.
+
+**`auto` shuffle partitions is correct.** Pinning to 512 changed nothing
+(479 s vs 478 s), so AQE was already picking a sane layout and the join is not
+partition-bound. The widget stays for A/B use; the default does not change.
+
+**The `count()` was doing real work.** `_scored_chunk` is a lazy view over the
+whole densify join, so counting it after the MERGE re-executes that join. The
+scored row count is plan-determined (every step is a left join on keys unique
+in the right side), so the scorer counts `plan_c` instead. ~7.5% at n=10 —
+single run per arm, so treat the direction as solid and the magnitude as
+approximate.
+
 Runs: n=10 W1 `682582972754812`; n=10 W4 `172832081298152`; n=100 chunk=10
 `107977029748806`; 1k chunk=25 cancelled `1107301303743633`; 1k chunk=10
 `317736927459014`.

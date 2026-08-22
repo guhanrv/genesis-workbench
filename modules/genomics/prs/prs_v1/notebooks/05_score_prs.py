@@ -34,11 +34,15 @@ dbutils.widgets.text("pgs_chunk_size", "0", "Fixed # PGS per score chunk (0 = us
 dbutils.widgets.text("max_weight_rows_per_chunk", "0", "Weight-row budget per chunk when pgs_chunk_size=0 (0 = no PGS chunking)")
 # 0 = all planned samples in one join (n=100 spilled). 10 = measured no-spill shape.
 dbutils.widgets.text("sample_chunk_size", "10", "Max samples per score join (0 = all-at-once)")
+# `auto` is the measured no-spill setting; a fixed count is A/B-only. Pinning too low grows
+# per-task memory, which is what OOM-killed the standard-memory node A/B.
+dbutils.widgets.text("shuffle_partitions", "auto", "spark.sql.shuffle.partitions (auto = AQE picks)")
 catalog = dbutils.widgets.get("catalog"); schema = dbutils.widgets.get("schema")
 missing_mode = dbutils.widgets.get("missing_mode").strip().lower()
 pgs_chunk_size = int(dbutils.widgets.get("pgs_chunk_size") or "0")
 max_weight_rows_per_chunk = int(dbutils.widgets.get("max_weight_rows_per_chunk") or "0")
 sample_chunk_size = int(dbutils.widgets.get("sample_chunk_size") or "0")
+shuffle_partitions = dbutils.widgets.get("shuffle_partitions").strip() or "auto"
 
 # COMMAND ----------
 
@@ -52,7 +56,7 @@ from delta.tables import DeltaTable
 from pyspark.sql import DataFrame
 
 spark.sql(f"USE CATALOG {catalog}"); spark.sql(f"USE SCHEMA {schema}")
-spark.conf.set("spark.sql.shuffle.partitions", "auto")  # bounded by classic cluster size
+spark.conf.set("spark.sql.shuffle.partitions", shuffle_partitions)  # bounded by classic cluster size
 
 plan = spark.table("_prs_reconcile_plan")                 # sample_id, pgs_id, weight_sha, panel_version
 if plan.limit(1).count() == 0:
@@ -286,7 +290,11 @@ for si, sids in enumerate(_sample_chunks):
             .whenNotMatchedInsertAll()
             .execute()
         )
-        n = spark.table("_scored_chunk").count()
+        # Count the PLAN, not `_scored_chunk`: the view is a lazy plan over the whole densify
+        # join, so counting it re-runs that join after the MERGE already consumed it. Every
+        # step from plan_c to `out` is a left join on keys unique in the right side, so the
+        # scored row count always equals the planned cell count.
+        n = plan_c.count()
         total_cells += n
         print(
             f"join[{join_i}/{n_joins}] sample_batch={si} n_samples={len(sids)} "

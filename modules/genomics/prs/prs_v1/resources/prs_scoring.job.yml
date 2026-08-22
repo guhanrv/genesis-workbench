@@ -242,6 +242,8 @@ resources:
           default: "0"
         - name: sample_chunk_size          # max samples per densify join; 0 = all-at-once
           default: "10"
+        - name: shuffle_partitions         # auto = AQE picks; fixed count is A/B-only
+          default: "auto"
         - name: missing_mode
           default: "mean_impute"
 
